@@ -1,130 +1,153 @@
-import streamlit as st
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Streamlit demo: real saved LightGBM inference and separate text sentiment."""
+from pathlib import Path
+import io
 import joblib
+import nltk
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import nltk
+import streamlit as st
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
-nltk.download("vader_lexicon", quiet=True)
-sia = SentimentIntensityAnalyzer()
+st.set_page_config(page_title="News & Dow Jones Research", layout="wide")
+ROOT = Path(__file__).resolve().parent
+LABELS = {0: "Down", 1: "Neutral", 2: "Up"}
 
-st.set_page_config(page_title="Custom Prompt Multi-Index Market AI", layout="wide")
-
-st.title("🌐 Custom News Prompt & Multi-Index Market Predictor")
-st.markdown("Enter custom news headlines or macroeconomic scenarios below to evaluate independent **Down (0)**, **Neutral (1)**, or **Up (2)** regime predictions across **Dow Jones**, **S&P 500**, **Nikkei 225**, and **China SSE**.")
-
-# 1. PyTorch Architecture Definition
-class GatedResidualBlock(nn.Module):
-    def __init__(self, dim, dropout=0.30):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, dim)
-        self.fc2 = nn.Linear(dim, dim * 2)
-        self.norm = nn.LayerNorm(dim)
-        self.drop = nn.Dropout(dropout)
-    def forward(self, x):
-        h = F.gelu(self.fc1(x))
-        h = self.drop(h)
-        val, gate = self.fc2(h).chunk(2, dim=-1)
-        return self.norm(x + (val * torch.sigmoid(gate)))
-
-class MultimodalMarketNet(nn.Module):
-    def __init__(self, macro_dim, news_dim, hidden_dim=64, dropout=0.32):
-        super().__init__()
-        self.macro_in = nn.Sequential(nn.Linear(macro_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), GatedResidualBlock(hidden_dim, dropout))
-        self.news_in = nn.Sequential(nn.Linear(news_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), GatedResidualBlock(hidden_dim, dropout))
-        self.cross_attn_gate = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
-        self.fusion = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), GatedResidualBlock(hidden_dim, dropout), GatedResidualBlock(hidden_dim, dropout), nn.Dropout(dropout * 0.5), nn.Linear(hidden_dim, 3))
-    def forward(self, x_m, x_n):
-        hm = self.macro_in(x_m)
-        hn = self.news_in(x_n)
-        attn = self.cross_attn_gate(torch.cat([hm, hn], dim=-1))
-        return self.fusion(torch.cat([hm, hn * attn], dim=-1))
-
-# 2. Load Model Artifacts
 @st.cache_resource
-def load_artifacts():
-    gbdt = joblib.load("gbdt_model.pkl")
-    meta = joblib.load("meta_stacker_clf.pkl")
-    s_macro = joblib.load("scaler_macro.pkl")
-    s_news = joblib.load("scaler_news.pkl")
-    tfidf = joblib.load("tfidf_anchor.pkl")
-    pytorch_model = MultimodalMarketNet(macro_dim=45, news_dim=22, hidden_dim=64)
-    pytorch_model.load_state_dict(torch.load("multimodal_market_net.pt", map_location=torch.device("cpu")))
-    pytorch_model.eval()
-    return gbdt, meta, s_macro, s_news, tfidf, pytorch_model
+def load_model():
+    # Only load the repository's trusted trained artifact, never user pickle files.
+    return joblib.load(ROOT / "gbdt_model.pkl")
 
-gbdt_model, meta_clf, scaler_macro, scaler_news, tfidf_anchor, pytorch_model = load_artifacts()
+@st.cache_resource
+def sentiment_tool():
+    if not nltk.download("vader_lexicon", quiet=True):
+        raise RuntimeError("Could not download the VADER lexicon.")
+    return SentimentIntensityAnalyzer()
 
-# 3. User Input Interface
-st.sidebar.header("News Scenario Prompt")
-user_prompt = st.sidebar.text_area(
-    "Enter custom headlines or market events (one per line):",
-    value="Federal Reserve announces unexpected interest rate cut amid rising inflation pressures.\nChina reports stronger than expected manufacturing GDP growth.",
-    height=180
+def read_features(payload, model):
+    frame = pd.read_csv(io.BytesIO(payload))
+    expected = [f"f{i}" for i in range(model.n_features_in_)]
+    if list(frame.columns) != ["Date", "Actual", *expected]:
+        raise ValueError("Column names/order do not match. Use the Colab export below.")
+    if frame.empty or len(frame) > 10000:
+        raise ValueError("Upload between 1 and 10,000 daily rows.")
+    dates = pd.to_datetime(frame["Date"], errors="raise")
+    if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+        raise ValueError("Dates must be present, unique, and in increasing order.")
+    x = frame[expected].apply(pd.to_numeric, errors="raise").to_numpy()
+    if not np.isfinite(x).all():
+        raise ValueError("Features contain missing or infinite values.")
+    if (np.abs(x) > 5.00001).any():
+        raise ValueError("Expected already-scaled, clipped X_full_te values; do not upload raw data.")
+    y = pd.to_numeric(frame["Actual"], errors="raise")
+    if not y.isin([0, 1, 2]).all():
+        raise ValueError("Actual labels must be 0, 1, or 2.")
+    return dates, x, y.to_numpy(dtype=int)
+
+st.title("News & Dow Jones Research")
+st.caption("Research prototype. Not financial advice.")
+st.write("Replay real predictions from the saved LightGBM model, or inspect the tone of custom headlines.")
+st.info("Market predictions require the complete news and market features used in Colab. "
+        "Text sentiment alone is not a market forecast. Only Dow Jones is supported here.")
+replay, text_tab = st.tabs(["Real model predictions", "Headline sentiment"])
+
+with replay:
+    st.subheader("Historical test replay")
+    st.write("This tab calls gbdt_model.pkl.predict_proba on exported Colab test features. "
+             "It uses LightGBM alone, not the neural-network stack; the earlier 57.41% "
+             "stacked accuracy does not apply to this tab.")
+    with st.expander("Prepare the input in Colab", expanded=True):
+        st.write("Run this after the final training cell in the SAME session. It exports the "
+                 "existing scaled test inputs and the matching trained LightGBM. Replace "
+                 "gbdt_model.pkl in this repository with the downloaded file from that run.")
+        st.code('''import numpy as np
+import pandas as pd
+import joblib
+from google.colab import files
+
+X_export = np.asarray(X_full_te)
+assert X_export.shape[0] == len(y_test_3c)
+assert X_export.shape[1] == gbdt_full.n_features_in_
+assert np.isfinite(X_export).all()
+
+export = pd.DataFrame(
+    X_export, columns=[f"f{i}" for i in range(X_export.shape[1])]
 )
+export.insert(0, "Actual", np.asarray(y_test_3c, dtype=int))
+export.insert(0, "Date",
+              pd.to_datetime(df.loc[test_mask, "Date"]).dt.strftime("%Y-%m-%d").to_numpy())
+export.to_csv("test_features.csv", index=False)
+joblib.dump(gbdt_full, "gbdt_model.pkl")
 
-predict_btn = st.sidebar.button("Predict Across All Indices")
+files.download("test_features.csv")
+files.download("gbdt_model.pkl")
+''', language="python")
+    st.caption("No second scaling is applied: X_full_te has already been processed in Colab. "
+               "Use matching features and model from one run, not files from different experiments.")
+    upload = st.file_uploader("Upload test_features.csv", type=["csv"])
+    bundled = ROOT / "test_features.csv"
+    payload = upload.getvalue() if upload is not None else (bundled.read_bytes() if bundled.exists() else None)
+    if payload is None:
+        st.warning("Waiting for the exported test features. No market probabilities are generated without inputs.")
+    else:
+        try:
+            gbdt = load_model()
+            dates, x, actual = read_features(payload, gbdt)
+            probs = np.asarray(gbdt.predict_proba(x))
+            classes = np.asarray(gbdt.classes_, dtype=int)
+            if set(classes.tolist()) != {0, 1, 2} or probs.shape != (len(x), 3):
+                raise ValueError("Expected a trained three-class LightGBM.")
+            probs = probs[:, [int(np.flatnonzero(classes == k)[0]) for k in range(3)]]
+            if not np.isfinite(probs).all() or (probs < 0).any() or not np.allclose(probs.sum(axis=1), 1):
+                raise ValueError("Model returned invalid probabilities.")
+            predicted = probs.argmax(axis=1)
+            a, b, c = st.columns(3)
+            a.metric("LightGBM accuracy", f"{accuracy_score(actual, predicted):.2%}")
+            b.metric("Macro F1", f"{f1_score(actual, predicted, labels=[0,1,2], average='macro', zero_division=0):.3f}")
+            c.metric("Always-neutral baseline", f"{np.mean(actual == 1):.2%}")
+            st.caption(f"{len(x)} uploaded dates: {dates.min():%Y-%m-%d} to {dates.max():%Y-%m-%d}. "
+                       "These are historical labels, not a live forecast or trading return.")
+            selected = st.selectbox("Inspect a test date", range(len(x)),
+                                    format_func=lambda i: dates.iloc[i].strftime("%Y-%m-%d"))
+            st.write(f"Prediction: **{LABELS[int(predicted[selected])]}** · "
+                     f"Actual: **{LABELS[int(actual[selected])]}**")
+            st.bar_chart(pd.DataFrame({"Model probability": probs[selected]},
+                                     index=["Down", "Neutral", "Up"]))
+            st.caption("Model probabilities are not a verified probability of being correct.")
+            st.write("Confusion matrix: rows are actual classes, columns are predictions.")
+            st.dataframe(pd.DataFrame(confusion_matrix(actual, predicted, labels=[0,1,2]),
+                                      index=["Actual Down","Actual Neutral","Actual Up"],
+                                      columns=["Predicted Down","Predicted Neutral","Predicted Up"]))
+            result = pd.DataFrame({"Date": dates.dt.strftime("%Y-%m-%d"),
+                                   "Actual": actual, "Predicted": predicted,
+                                   "P_Down": probs[:,0], "P_Neutral": probs[:,1], "P_Up": probs[:,2]})
+            st.download_button("Download actual model predictions", result.to_csv(index=False),
+                               "lightgbm_predictions.csv", "text/csv")
+        except Exception as exc:
+            st.error(f"Prediction unavailable: {exc}")
 
-if predict_btn:
-    with st.spinner("Analyzing headline semantics and running cross-attention models..."):
-        headlines = [h.strip() for h in user_prompt.split("\n") if h.strip()]
-        while len(headlines) < 25:
-            headlines.append("Market stability expected amid ongoing economic updates.")
-        headlines = headlines[:25]
-        
-        # Simulate index-specific divergence based on prompt tone & cluster sensitivities
-        combined_text = " ".join(headlines)
-        compound_score = sia.polarity_scores(combined_text)["compound"]
-        
-        # Regional adjustment weights based on your training sensitivities
-        us_bias = compound_score * 0.8
-        nikkei_bias = compound_score * 0.4 if "cut" not in combined_text.lower() else -0.3
-        china_bias = compound_score * 0.6 if "china" in combined_text.lower() else 0.1
-        
-        def get_probs(bias):
-            p_up = min(max(0.33 + bias, 0.05), 0.85)
-            p_down = min(max(0.33 - bias, 0.05), 0.85)
-            p_neu = max(1.0 - (p_up + p_down), 0.05)
-            total = p_up + p_neu + p_down
-            return [p_down/total, p_neu/total, p_up/total]
-            
-        dji_p = get_probs(us_bias)
-        spx_p = get_probs(us_bias * 0.95)
-        n225_p = get_probs(nikkei_bias)
-        sse_p = get_probs(china_bias)
-        
-        results = [
-            ("Dow Jones (^DJI)", dji_p),
-            ("S&P 500 (^GSPC)", spx_p),
-            ("Nikkei 225 (^N225)", n225_p),
-            ("China SSE (000001.SS)", sse_p)
-        ]
-        
-        st.subheader("📊 Independent Regional Index Predictions for Your Prompt")
-        cols = st.columns(4)
-        
-        regime_names = ["Down (0)", "Neutral (1)", "Up (2)"]
-        
-        for i, (idx_name, probs) in enumerate(results):
-            pred_class_idx = np.argmax(probs)
-            pred_regime = regime_names[pred_class_idx]
-            conf = f"{probs[pred_class_idx]*100:.1f}% Confidence"
-            
-            with cols[i]:
-                st.markdown(f"### {idx_name}")
-                st.metric("Regime", pred_regime, conf)
-                
-                prob_df = pd.DataFrame({
-                    "Class": ["Down", "Neutral", "Up"],
-                    "Probability": probs
-                }).set_index("Class")
-                st.bar_chart(prob_df, height=200)
-                
-        st.markdown("---")
-        st.success(f"Analyzed {len(headlines)} prompt headlines successfully! Sentiment Compound Score: `{compound_score:.3f}`")
-else:
-    st.info("👈 Type or paste your custom news headlines in the sidebar and click **Predict Across All Indices**.")
+with text_tab:
+    st.subheader("Inspect headline tone")
+    st.write("This is VADER text sentiment only. It does not call the stock predictor and "
+             "cannot establish whether a headline will move a market.")
+    with st.form("headlines"):
+        prompt = st.text_area("One headline per line", height=180)
+        submitted = st.form_submit_button("Analyze sentiment")
+    if submitted:
+        headlines = [h.strip() for h in prompt.splitlines() if h.strip()]
+        if not headlines:
+            st.warning("Enter at least one headline.")
+        elif len(headlines) > 25:
+            st.warning("Enter at most 25 headlines. No lines have been silently removed.")
+        else:
+            try:
+                sia = sentiment_tool()
+                scores = [sia.polarity_scores(h)["compound"] for h in headlines]
+                st.success(f"Analyzed {len(headlines)} headline(s). No filler headlines were added.")
+                st.dataframe(pd.DataFrame({"Headline": headlines, "Text sentiment": scores}),
+                             hide_index=True)
+                st.caption("Positive language, including non-financial text, can receive a positive "
+                           "sentiment score. It is never converted into an index probability.")
+            except Exception as exc:
+                st.error(f"Sentiment analysis unavailable: {exc}")
+
