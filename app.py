@@ -7,12 +7,8 @@ import joblib
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sklearn.metrics.pairwise import cosine_similarity
-
-nltk.download("vader_lexicon", quiet=True)
-sia = SentimentIntensityAnalyzer()
+from transformers import BertTokenizer, BertForSequenceClassification
 
 st.set_page_config(page_title="Custom Prompt Multi-Index Market AI", layout="wide")
 st.title("🌐 Custom News Prompt & Multi-Index Market Predictor")
@@ -22,8 +18,19 @@ st.markdown(
     "across **Dow Jones**, **S&P 500**, **Nikkei 225**, and **China SSE**."
 )
 
+# Exact 6 Domain-Anchored Macro Prototypes from Cell [41] of kaggle.ipynb
+ANCHOR_TOPICS = {
+    "Monetary_Fed_Rates": "federal reserve interest rate central bankecb boj inflation monetary policy treasury yield bond",
+    "Global_Trade_China": "china trade export import tariff manufacturing gdp growth economy beijing asia supply chain",
+    "Energy_Oil_Commodities": "oil crude opec energy gas barrel commodity gold copper prices production pipeline",
+    "Banking_Credit_Markets": "bank Wall Street credit debt loan financial crisis hedge fund stock market investor",
+    "Sovereign_FX_Fiscal": "currency dollar euro yen yuan debt ceiling budget deficit imf sovereign bailout tax",
+    "Geopolitics_Security": "war military sanction nuclear missile conflict russia ukraine iran israel strike treaty",
+}
+N_CLUSTERS = len(ANCHOR_TOPICS)
 
-# 1. Two-Tower Cross-Attention Architecture (Exact match to kaggle.ipynb)
+
+# 1. Exact PyTorch Two-Tower Cross-Attention Architecture (Cell [42] of kaggle.ipynb)
 class GatedResidualBlock(nn.Module):
     def __init__(self, dim, dropout=0.30):
         super().__init__()
@@ -73,465 +80,280 @@ class MultimodalMarketNet(nn.Module):
     def forward(self, x_m, x_n):
         hm = self.macro_in(x_m)
         hn = self.news_in(x_n)
-        attn = self.cross_attn_gate(torch.cat([hm, hn], dim=-1))
-        return self.fusion(torch.cat([hm, hn * attn], dim=-1))
+        attn_weights = self.cross_attn_gate(torch.cat([hm, hn], dim=-1))
+        hn_modulated = hn * attn_weights
+        return self.fusion(torch.cat([hm, hn_modulated], dim=-1))
 
 
-# 2. Load Trained Model Artifacts & FinBERT
+# 2. Load Exact FinBERT (yiyanghkust/finbert-tone from Cell [9]) & Trained Artifacts
 @st.cache_resource
-def load_finbert():
-    try:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+def load_models():
+    # FinBERT from Cell [9]: output classes are strictly [0: Neutral, 1: Positive, 2: Negative]
+    fb_tokenizer = BertTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+    fb_model = BertForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+    fb_model.eval()
 
-        tok = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        mdl = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-        mdl.eval()
-        return tok, mdl
-    except Exception:
-        return None, None
-
-
-@st.cache_resource
-def load_artifacts():
     gbdt = joblib.load("gbdt_model.pkl")
     meta = joblib.load("meta_stacker_clf.pkl")
     s_macro = joblib.load("scaler_macro.pkl")
     s_news = joblib.load("scaler_news.pkl")
-    tfidf_raw = joblib.load("tfidf_anchor.pkl")
-    reg_heads = joblib.load("regional_heads.pkl") if os.path.exists("regional_heads.pkl") else None
+    tfidf_loaded = joblib.load("tfidf_anchor.pkl")
+    tfidf_vec = tfidf_loaded["vectorizer"] if isinstance(tfidf_loaded, dict) else tfidf_loaded
 
     macro_dim = int(getattr(s_macro, "n_features_in_", 45))
     news_dim = int(getattr(s_news, "n_features_in_", 22))
 
-    pytorch_model = MultimodalMarketNet(macro_dim=macro_dim, news_dim=news_dim, hidden_dim=64)
-    state_dict = torch.load("multimodal_market_net.pt", map_location=torch.device("cpu"))
-    pytorch_model.load_state_dict(state_dict)
-    pytorch_model.eval()
+    nn_model = MultimodalMarketNet(macro_dim=macro_dim, news_dim=news_dim, hidden_dim=64)
+    nn_model.load_state_dict(
+        torch.load("multimodal_market_net.pt", map_location=torch.device("cpu"))
+    )
+    nn_model.eval()
 
-    return gbdt, meta, s_macro, s_news, tfidf_raw, reg_heads, pytorch_model
+    # Load leak-free per-index Two-Tower ensembles if exported from updated Cell [35]
+    reg_ensembles = None
+    if os.path.exists("regional_ensembles.pkl"):
+        raw_ens = joblib.load("regional_ensembles.pkl")
+        reg_ensembles = {}
+        for sym, pack in raw_ens.items():
+            idx_nn = MultimodalMarketNet(macro_dim=macro_dim, news_dim=news_dim, hidden_dim=64)
+            idx_nn.load_state_dict(pack["nn_state_dict"])
+            idx_nn.eval()
+            reg_ensembles[sym] = {
+                "nn": idx_nn,
+                "gbdt": pack["gbdt"],
+                "meta": pack["meta"],
+                "mask_cols": pack.get("mask_cols", []),
+            }
+
+    return fb_tokenizer, fb_model, gbdt, meta, s_macro, s_news, tfidf_vec, nn_model, reg_ensembles
 
 
-finbert_tok, finbert_mdl = load_finbert()
-gbdt_model, meta_clf, scaler_macro, scaler_news, tfidf_obj, regional_heads, pytorch_model = load_artifacts()
+(
+    finbert_tokenizer,
+    finbert_model,
+    gbdt_model,
+    meta_clf,
+    scaler_macro,
+    scaler_news,
+    tfidf_anchor,
+    pytorch_model,
+    regional_ensembles,
+) = load_models()
 
 
-# 3. Exact 22-Feature News Pipeline (FinBERT + VADER + TF-IDF Class Anchors + Topic Shares)
-def score_finbert(headlines: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns arrays of (p_pos, p_neg, p_neu) for each headline using ProsusAI/finbert."""
-    if finbert_tok is not None and finbert_mdl is not None:
-        inputs = finbert_tok(
-            headlines, padding=True, truncation=True, max_length=128, return_tensors="pt"
+# 3. Exact 22-Feature News Tensor (Matches Cell [9] + Cell [41] 1-to-1, Zero VADER)
+def build_news_features_cell41(headlines: list[str]) -> tuple[np.ndarray, float, dict]:
+    n_hl = len(headlines)
+    rank_w = np.array([1.0 / np.log2(i + 1) for i in range(1, n_hl + 1)], dtype=np.float32)
+    rank_w /= rank_w.sum()
+
+    # A. Score each headline & daily concatenated block with yiyanghkust/finbert-tone
+    with torch.no_grad():
+        hl_inputs = finbert_tokenizer(
+            headlines, return_tensors="pt", truncation=True, max_length=512, padding=True
         )
-        with torch.no_grad():
-            logits = finbert_mdl(**inputs).logits
-            probs = F.softmax(logits, dim=-1).cpu().numpy()
-        # ProsusAI/finbert label mapping: {0: positive, 1: negative, 2: neutral}
-        id2label = getattr(finbert_mdl.config, "id2label", {0: "positive", 1: "negative", 2: "neutral"})
-        pos_idx = next((k for k, v in id2label.items() if "pos" in v.lower()), 0)
-        neg_idx = next((k for k, v in id2label.items() if "neg" in v.lower()), 1)
-        neu_idx = next((k for k, v in id2label.items() if "neu" in v.lower()), 2)
-        return probs[:, pos_idx], probs[:, neg_idx], probs[:, neu_idx]
+        hl_probs = F.softmax(finbert_model(**hl_inputs).logits, dim=-1).cpu().numpy()
 
-    # Graceful fallback to calibrated VADER probabilities only if `transformers` isn't installed
-    vs = [sia.polarity_scores(h) for h in headlines]
-    p_pos = np.array([v["pos"] for v in vs], dtype=np.float32)
-    p_neg = np.array([v["neg"] for v in vs], dtype=np.float32)
-    p_neu = np.array([v["neu"] for v in vs], dtype=np.float32)
-    return p_pos, p_neg, p_neu
+        daily_text = " ".join(headlines)
+        day_inputs = finbert_tokenizer(
+            [daily_text], return_tensors="pt", truncation=True, max_length=512, padding=True
+        )
+        day_probs = F.softmax(finbert_model(**day_inputs).logits, dim=-1).cpu().numpy()[0]
 
-
-def build_exact_22d_news_features(headlines: list[str]) -> tuple[np.ndarray, dict]:
-    """Builds the exact 22 news features engineered in Part 2 of kaggle.ipynb."""
-    news_dim = int(getattr(scaler_news, "n_features_in_", 22))
-
-    # A. FinBERT Headline Probabilities (9 features)
-    fb_pos, fb_neg, fb_neu = score_finbert(headlines)
+    # yiyanghkust/finbert-tone order: [0: Neutral, 1: Positive, 2: Negative]
+    fb_neu = float(day_probs[0])
+    fb_pos = float(day_probs[1])
+    fb_neg = float(day_probs[2])
     fb_net = fb_pos - fb_neg
 
-    fb_pos_mean = float(np.mean(fb_pos))
-    fb_neg_mean = float(np.mean(fb_neg))
-    fb_neu_mean = float(np.mean(fb_neu))
-    fb_net_mean = float(np.mean(fb_net))
-    fb_net_std = float(np.std(fb_net)) if len(fb_net) > 1 else 0.0
-    fb_pos_max = float(np.max(fb_pos))
-    fb_neg_max = float(np.max(fb_neg))
-    fb_bull_ratio = float(np.mean(fb_net > 0.10))
-    fb_bear_ratio = float(np.mean(fb_net < -0.10))
+    # Per-headline neural polarity in [-1.0, +1.0]
+    sents = (hl_probs[:, 1] - hl_probs[:, 2]).astype(np.float32)
 
-    # B. VADER Lexicon Features (7 features)
-    v_scores = [sia.polarity_scores(h) for h in headlines]
-    v_comp = np.array([s["compound"] for s in v_scores], dtype=np.float32)
-    v_pos = np.array([s["pos"] for s in v_scores], dtype=np.float32)
-    v_neg = np.array([s["neg"] for s in v_scores], dtype=np.float32)
+    # B. Project onto the exact 6 ANCHOR_TOPICS via fitted tfidf_anchor (Cell [41])
+    anchor_vecs = tfidf_anchor.transform(list(ANCHOR_TOPICS.values()))
+    hl_tfidf = tfidf_anchor.transform(headlines)
+    sims = cosine_similarity(hl_tfidf, anchor_vecs)  # Shape: (n_hl, 6)
 
-    vader_comp_mean = float(np.mean(v_comp))
-    vader_comp_std = float(np.std(v_comp)) if len(v_comp) > 1 else 0.0
-    vader_comp_min = float(np.min(v_comp))
-    vader_comp_max = float(np.max(v_comp))
-    vader_pos_mean = float(np.mean(v_pos))
-    vader_neg_mean = float(np.mean(v_neg))
-    vader_net = float(np.mean(v_comp > 0.05) - np.mean(v_comp < -0.05))
+    # Start from scaler_news.center_ for inactive topic slots so 0 cosine overlap maps to 0.0
+    # after RobustScaler instead of shifting positive against negative r/worldnews medians
+    centers = (
+        np.asarray(scaler_news.center_, dtype=np.float32)
+        if hasattr(scaler_news, "center_")
+        else np.zeros(22, dtype=np.float32)
+    )
 
-    # C. TF-IDF Class-Anchor Cosine Similarity Features (4 features)
-    joined_doc = " ".join(headlines)
-    if isinstance(tfidf_obj, dict) and "vectorizer" in tfidf_obj:
-        vec = tfidf_obj["vectorizer"]
-        x_tf = vec.transform([joined_doc])
-        c0 = np.asarray(tfidf_obj["c0"]).reshape(1, -1)
-        c1 = np.asarray(tfidf_obj["c1"]).reshape(1, -1)
-        c2 = np.asarray(tfidf_obj["c2"]).reshape(1, -1)
-        sim_down = float(cosine_similarity(x_tf, c0)[0, 0])
-        sim_neu = float(cosine_similarity(x_tf, c1)[0, 0])
-        sim_up = float(cosine_similarity(x_tf, c2)[0, 0])
-        sim_spread = sim_up - sim_down
-        saved_news_cols = tfidf_obj.get("news_cols", [])
-    elif hasattr(tfidf_obj, "transform"):
-        # Backward compatibility if old tfidf_anchor.pkl (raw TfidfVectorizer) is still on disk:
-        # Score bullish vs bearish vocabulary anchors directly inside the fitted TF-IDF space
-        x_tf = tfidf_obj.transform([joined_doc])
-        bull_anchor = tfidf_obj.transform(
-            ["surge rally growth cut recovery boom beat profit record stimulus gain"]
-        )
-        bear_anchor = tfidf_obj.transform(
-            ["crash recession crisis default inflation war plunge drop fear loss Cut"]
-        )
-        neu_anchor = tfidf_obj.transform(
-            ["steady unchanged hold report meeting session market index"]
-        )
-        sim_down = float(cosine_similarity(x_tf, bear_anchor)[0, 0])
-        sim_neu = float(cosine_similarity(x_tf, neu_anchor)[0, 0])
-        sim_up = float(cosine_similarity(x_tf, bull_anchor)[0, 0])
-        sim_spread = sim_up - sim_down
-        saved_news_cols = []
-    else:
-        sim_down, sim_neu, sim_up, sim_spread = 0.0, 0.0, 0.0, 0.0
-        saved_news_cols = []
+    cluster_sent = centers[0:6].copy()
+    cluster_mass = centers[6:12].copy()
 
-    # D. Macro / Geopolitical Keyword Intensity Features (2 features -> Total = 22)
-    low_doc = joined_doc.lower()
-    macro_kw = sum(
-        k in low_doc
-        for k in ["fed", "rate", "inflation", "gdp", "jobs", "cpi", "central bank", "stimulus", "yield"]
-    ) / max(len(headlines), 1)
-    risk_kw = sum(
-        k in low_doc
-        for k in ["war", "crisis", "crash", "sanction", "default", "recession", "tariff", "bankrupt"]
-    ) / max(len(headlines), 1)
+    w_s = sents * rank_w
+    for k in range(N_CLUSTERS):
+        rel = sims[:, k]
+        mass_k = float(np.sum(rank_w * rel))
+        if mass_k > 1e-6:
+            cluster_sent[k] = float(np.sum(w_s * rel))
+            cluster_mass[k] = mass_k
 
-    feature_lookup = {
-        "fb_pos_mean": fb_pos_mean,
-        "fb_neg_mean": fb_neg_mean,
-        "fb_neu_mean": fb_neu_mean,
-        "fb_net_mean": fb_net_mean,
-        "fb_net_std": fb_net_std,
-        "fb_pos_max": fb_pos_max,
-        "fb_neg_max": fb_neg_max,
-        "fb_bull_ratio": fb_bull_ratio,
-        "fb_bear_ratio": fb_bear_ratio,
-        "vader_comp_mean": vader_comp_mean,
-        "vader_comp_std": vader_comp_std,
-        "vader_comp_min": vader_comp_min,
-        "vader_comp_max": vader_comp_max,
-        "vader_pos_mean": vader_pos_mean,
-        "vader_neg_mean": vader_neg_mean,
-        "vader_net": vader_net,
-        "tfidf_sim_down": sim_down,
-        "tfidf_sim_neu": sim_neu,
-        "tfidf_sim_up": sim_up,
-        "tfidf_sim_spread": sim_spread,
-        "macro_kw_intensity": float(macro_kw),
-        "risk_kw_intensity": float(risk_kw),
+    fin_rel_total = sims.max(axis=1)
+    # Use learned median relevance (centers[16]) as floor when custom terms fall outside anchor strings
+    eff_rel = np.maximum(fin_rel_total, float(max(centers[16], 0.12)))
+
+    summary_stats = np.zeros(6, dtype=np.float32)
+    summary_stats[0] = float(np.sum(sents * rank_w * (eff_rel + 0.05)))
+    summary_stats[1] = float(np.std(sents)) if n_hl > 1 else float(centers[13])
+    summary_stats[2] = float(np.min(sents))
+    summary_stats[3] = float(np.max(sents))
+    summary_stats[4] = float(np.mean(fin_rel_total)) if np.any(fin_rel_total > 0) else float(centers[16])
+    summary_stats[5] = float(np.mean(sents < -0.3) - np.mean(sents > 0.3))
+
+    fb_vec = np.array([fb_neu, fb_pos, fb_neg, fb_net], dtype=np.float32)
+
+    # Exact 22-column order from Cell [41]: [cluster_sent(6), cluster_mass(6), summary_stats(6), finbert(4)]
+    x_news_raw = np.concatenate([cluster_sent, cluster_mass, summary_stats, fb_vec]).reshape(1, -1)
+    x_news_s = np.clip(scaler_news.transform(x_news_raw), -5.0, 5.0).astype(np.float32)
+
+    diag = {
+        "fb_neu": fb_neu,
+        "fb_pos": fb_pos,
+        "fb_neg": fb_neg,
+        "fb_net": fb_net,
+        "news_col12_raw": float(summary_stats[0]),
     }
-
-    default_22 = list(feature_lookup.values())
-
-    # Map by exact column name if present in scaler_news or tfidf_bundle
-    target_cols = list(getattr(scaler_news, "feature_names_in_", [])) or saved_news_cols
-    if target_cols and len(target_cols) == news_dim:
-        vec = []
-        for idx, c in enumerate(target_cols):
-            cl = c.lower()
-            if c in feature_lookup:
-                vec.append(feature_lookup[c])
-            elif "finbert" in cl or cl.startswith("fb_"):
-                if "pos" in cl and "max" in cl:
-                    vec.append(fb_pos_max)
-                elif "neg" in cl and "max" in cl:
-                    vec.append(fb_neg_max)
-                elif "pos" in cl:
-                    vec.append(fb_pos_mean)
-                elif "neg" in cl:
-                    vec.append(fb_neg_mean)
-                elif "neu" in cl:
-                    vec.append(fb_neu_mean)
-                elif "std" in cl:
-                    vec.append(fb_net_std)
-                elif "bull" in cl:
-                    vec.append(fb_bull_ratio)
-                elif "bear" in cl:
-                    vec.append(fb_bear_ratio)
-                else:
-                    vec.append(fb_net_mean)
-            elif "vader" in cl:
-                if "std" in cl:
-                    vec.append(vader_comp_std)
-                elif "min" in cl:
-                    vec.append(vader_comp_min)
-                elif "max" in cl:
-                    vec.append(vader_comp_max)
-                elif "pos" in cl:
-                    vec.append(vader_pos_mean)
-                elif "neg" in cl:
-                    vec.append(vader_neg_mean)
-                elif "net" in cl or "diff" in cl:
-                    vec.append(vader_net)
-                else:
-                    vec.append(vader_comp_mean)
-            elif any(k in cl for k in ["tfidf", "anchor", "sim", "cent"]):
-                if "down" in cl or "0" in cl or "bear" in cl:
-                    vec.append(sim_down)
-                elif "up" in cl or "2" in cl or "bull" in cl:
-                    vec.append(sim_up)
-                elif "neu" in cl or "1" in cl:
-                    vec.append(sim_neu)
-                else:
-                    vec.append(sim_spread)
-            else:
-                vec.append(default_22[idx % len(default_22)])
-        raw_arr = np.array(vec, dtype=np.float32).reshape(1, -1)
-    else:
-        raw_arr = np.array(default_22[:news_dim], dtype=np.float32).reshape(1, -1)
-        if raw_arr.shape[1] < news_dim:
-            raw_arr = np.pad(raw_arr, ((0, 0), (0, news_dim - raw_arr.shape[1])))
-
-    if hasattr(scaler_news, "feature_names_in_"):
-        raw_in = pd.DataFrame(raw_arr, columns=scaler_news.feature_names_in_)
-    else:
-        raw_in = raw_arr
-
-    x_news_s = scaler_news.transform(raw_in).astype(np.float32)
-    x_news_s = np.clip(np.nan_to_num(x_news_s, nan=0.0), -4.5, 4.5)
-
-    diagnostics = {
-        "finbert_active": finbert_mdl is not None,
-        "fb_net": fb_net_mean,
-        "vader_comp": vader_comp_mean,
-        "tfidf_spread": sim_spread,
-    }
-    return x_news_s, diagnostics
+    return x_news_s, float(summary_stats[0]), diag
 
 
-# 4. Exact 45-Feature Live Market + FRED Pipeline (Matches Part 1 of kaggle.ipynb)
+# 4. Exact 45-Feature Macro Tensor (Matches Cell [40] + Cell [41] 1-to-1)
 @st.cache_data(ttl=900)
-def fetch_live_macro_and_market() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+def fetch_market_and_fred() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
     tickers = ["^DJI", "^GSPC", "^N225", "000001.SS", "^VIX"]
     mkt = {}
     for sym in tickers:
-        try:
-            h = yf.Ticker(sym).history(period="6mo", interval="1d", auto_adjust=True)
-            if h is not None and not h.empty:
-                if getattr(h.index, "tz", None) is not None:
-                    h.index = h.index.tz_localize(None)
-                h.index = h.index.normalize()
-                mkt[sym] = h[["Open", "High", "Low", "Close", "Volume"]].ffill().bfill()
-        except Exception:
-            pass
+        df_t = yf.Ticker(sym).history(period="6mo", interval="1d", auto_adjust=True)
+        if df_t is not None and not df_t.empty:
+            if getattr(df_t.index, "tz", None) is not None:
+                df_t.index = df_t.index.tz_localize(None)
+            df_t.index = df_t.index.normalize()
+            mkt[sym] = df_t[["Open", "High", "Low", "Close", "Volume"]].ffill().bfill()
 
-    # Fetch exact 5 FRED series from Part 1 directly from St. Louis Fed CSV endpoints (zero API key needed)
     fred_codes = ["T10Y2Y", "BAA10Y", "DCOILWTICO", "DEXJPUS", "DEXCHUS"]
     start_dt = (pd.Timestamp.today() - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-    fred_dict = {}
-    for code in fred_codes:
-        try:
-            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}&cosd={start_dt}"
-            s = pd.read_csv(url, index_col=0, parse_dates=True).iloc[:, 0]
-            fred_dict[code] = pd.to_numeric(s, errors="coerce").ffill()
-        except Exception:
-            fred_dict[code] = pd.Series(dtype=float)
+    fred_cols = {}
+    for c in fred_codes:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={c}&cosd={start_dt}"
+        s = pd.read_csv(url, index_col=0, parse_dates=True)[c]
+        fred_cols[c] = pd.to_numeric(s, errors="coerce").ffill()
 
-    fred_df = pd.DataFrame(fred_dict).ffill().bfill()
-    return mkt, fred_df
+    return mkt, pd.DataFrame(fred_cols).ffill().bfill()
 
 
-def build_exact_45d_macro_features(
-    mkt: dict[str, pd.DataFrame], fred_df: pd.DataFrame, focus_sym: str
+def build_macro_features_cell40(
+    mkt: dict[str, pd.DataFrame],
+    fred_df: pd.DataFrame,
+    news_roll3_val: float,
+    focus_sym: str,
 ) -> np.ndarray:
-    """
-    Constructs the exact 45 market + FRED macro features from Part 1 of kaggle.ipynb.
-    When evaluating a non-DJI regional index (if regional_heads.pkl is not yet uploaded),
-    adapts the primary equity block to `focus_sym` so each index reflects its own live tape.
-    """
-    macro_dim = int(getattr(scaler_macro, "n_features_in_", 45))
-    feat_map = {}
+    """Builds exact 44 market/FRED columns (Cell [40]) + 45th column `news_roll3` (Cell [41])."""
+    vals = []
 
-    # Determine primary & secondary equity tickers
-    primary_sym = "^DJI" if regional_heads is not None else focus_sym
-    secondary_sym = "^GSPC" if primary_sym != "^GSPC" else "^DJI"
-
-    for sym, tag in [(primary_sym, "DJI"), (secondary_sym, "SPX")]:
-        df_s = mkt.get(sym)
-        if df_s is not None and len(df_s) >= 25:
-            c = df_s["Close"]
-            h = df_s["High"]
-            l = df_s["Low"]
-            o = df_s["Open"]
-            v = df_s["Volume"].replace(0, np.nan).ffill().fillna(1.0)
-            r = c.pct_change()
-
-            r_lag1 = r.shift(1)
-            vol5 = float(r_lag1.rolling(5).std().iloc[-1])
-            vol20 = float(r_lag1.rolling(20).std().iloc[-1])
-            hl_range = (h - l) / (c + 1e-6)
-            vol_s1 = v.shift(1)
-
-            feat_map[f"{tag}_ret_lag1"] = float(r.iloc[-2])
-            feat_map[f"{tag}_ret_lag2"] = float(r.iloc[-3])
-            feat_map[f"{tag}_ret_ma5"] = float(r_lag1.rolling(5).mean().iloc[-1])
-            feat_map[f"{tag}_ret_ma20"] = float(r_lag1.rolling(20).mean().iloc[-1])
-            feat_map[f"{tag}_vol_5d"] = vol5
-            feat_map[f"{tag}_vol_20d"] = vol20
-            feat_map[f"{tag}_vol_ratio"] = vol5 / (vol20 + 1e-6)
-            feat_map[f"{tag}_hl_range_lag1"] = float(hl_range.iloc[-2])
-            feat_map[f"{tag}_hl_range_ma5"] = float(hl_range.shift(1).rolling(5).mean().iloc[-1])
-            feat_map[f"{tag}_open_gap_t"] = float((o.iloc[-1] / (c.iloc[-2] + 1e-6)) - 1.0)
-            feat_map[f"{tag}_vol_z_lag1"] = float(
-                (vol_s1.iloc[-1] - vol_s1.rolling(20).mean().iloc[-1])
-                / (vol_s1.rolling(20).std().iloc[-1] + 1e-6)
-            )
-        else:
-            for sfx in [
-                "ret_lag1", "ret_lag2", "ret_ma5", "ret_ma20", "vol_5d", "vol_20d",
-                "vol_ratio", "hl_range_lag1", "hl_range_ma5", "open_gap_t", "vol_z_lag1",
-            ]:
-                feat_map[f"{tag}_{sfx}"] = 0.0
-
-    # VIX features (4 features -> running total: 26)
-    vix_df = mkt.get("^VIX")
-    if vix_df is not None and len(vix_df) >= 25:
-        vc = vix_df["Close"]
-        vo = vix_df["Open"]
-        feat_map["VIX_lag1"] = float(vc.iloc[-2])
-        feat_map["VIX_diff1"] = float(vc.diff().iloc[-2])
-        feat_map["VIX_ma_rat"] = float(vc.iloc[-2] / (vc.shift(1).rolling(20).mean().iloc[-1] + 1e-6))
-        feat_map["VIX_open_t"] = float(vo.iloc[-1] / (vc.iloc[-2] + 1e-6) - 1.0)
+    # Swap primary ticker only when evaluating single-target model across non-DJI indices
+    if regional_ensembles is not None:
+        us_pairs = [("^DJI", "DJI"), ("^GSPC", "SPX")]
     else:
-        feat_map.update({"VIX_lag1": 18.0, "VIX_diff1": 0.0, "VIX_ma_rat": 1.0, "VIX_open_t": 0.0})
+        sec = "^GSPC" if focus_sym != "^GSPC" else "^DJI"
+        us_pairs = [(focus_sym, "DJI"), (sec, "SPX")]
 
-    # Pre-Market Asian Session Returns: Nikkei & SSE (8 features -> running total: 34)
-    for sym, tag in [("^N225", "NIKKEI"), ("000001.SS", "SSE")]:
-        adf = mkt.get(sym)
-        if adf is not None and len(adf) >= 15:
-            ar = adf["Close"].pct_change()
-            feat_map[f"{tag}_preUS_ret_t"] = float(ar.iloc[-1])
-            feat_map[f"{tag}_ret_lag1"] = float(ar.iloc[-2])
-            feat_map[f"{tag}_ret_ma5"] = float(ar.rolling(5).mean().iloc[-1])
-            feat_map[f"{tag}_vol_10d"] = float(ar.rolling(10).std().iloc[-1])
-        else:
-            feat_map.update(
-                {f"{tag}_preUS_ret_t": 0.0, f"{tag}_ret_lag1": 0.0, f"{tag}_ret_ma5": 0.0, f"{tag}_vol_10d": 0.01}
-            )
+    # Cols 0..21: Strictly lagged US features (t-1 = iloc[-1], t-2 = iloc[-2])
+    for sym, _ in us_pairs:
+        d = mkt[sym]
+        c, h, l, v = d["Close"], d["High"], d["Low"], d["Volume"].replace(0, np.nan).ffill().fillna(1.0)
+        r = c.pct_change()
+        vol_5d = float(r.rolling(5).std().iloc[-1])
+        vol_20d = float(r.rolling(20).std().iloc[-1])
+        hl_range = (h - l) / (c + 1e-6)
+        vol_z = float((v.iloc[-1] - v.rolling(20).mean().iloc[-1]) / (v.rolling(20).std().iloc[-1] + 1e-6))
 
-    # FRED Macroeconomic Series: 5 codes x 2 (lag1, chg5) = 10 features -> running total: 44
+        vals.extend([
+            float(r.iloc[-1]),                       # ret_lag1
+            float(r.iloc[-2]),                       # ret_lag2
+            float(r.rolling(5).mean().iloc[-1]),     # ret_ma5
+            float(r.rolling(20).mean().iloc[-1]),    # ret_ma20
+            vol_5d,                                  # vol_5d
+            vol_20d,                                 # vol_20d
+            vol_5d / (vol_20d + 1e-6),               # vol_ratio
+            float(hl_range.iloc[-1]),                # hl_range_lag1
+            float(hl_range.rolling(5).mean().iloc[-1]),  # hl_range_ma5
+            0.0,                                     # open_gap_t (0.0 prior to next session open)
+            vol_z,                                   # vol_z_lag1
+        ])
+
+    # Cols 22..25: VIX features
+    vc = mkt["^VIX"]["Close"]
+    vals.extend([
+        float(vc.iloc[-1]),                                        # VIX_lag1
+        float(vc.diff().iloc[-1]),                                 # VIX_diff1
+        float(vc.iloc[-1] / (vc.rolling(20).mean().iloc[-1] + 1e-6)),  # VIX_ma_rat
+        0.0,                                                       # VIX_open_t
+    ])
+
+    # Cols 26..33: Asian session features (NIKKEI cols 26..29, SSE cols 30..33)
+    for sym in ["^N225", "000001.SS"]:
+        ar = mkt[sym]["Close"].pct_change()
+        pre_ret = 0.0 if sym == focus_sym else float(ar.iloc[-1])
+        vals.extend([
+            pre_ret,                                 # preUS_ret_t (masked when predicting own index)
+            float(ar.iloc[-1]),                      # ret_lag1
+            float(ar.rolling(5).mean().iloc[-1]),    # ret_ma5
+            float(ar.rolling(10).std().iloc[-1]),    # vol_10d
+        ])
+
+    # Cols 34..43: FRED Macroeconomic Series (lag1 & chg5)
     for code in ["T10Y2Y", "BAA10Y", "DCOILWTICO", "DEXJPUS", "DEXCHUS"]:
-        s = fred_df[code].dropna() if code in fred_df.columns else pd.Series(dtype=float)
-        if len(s) >= 7:
-            feat_map[f"{code}_lag1"] = float(s.iloc[-2])
-            feat_map[f"{code}_chg5"] = float(s.iloc[-2] - s.iloc[-7])
-        else:
-            feat_map[f"{code}_lag1"] = 0.0
-            feat_map[f"{code}_chg5"] = 0.0
+        s = fred_df[code].dropna()
+        vals.extend([
+            float(s.iloc[-1]),               # {code}_lag1
+            float(s.iloc[-1] - s.iloc[-6]),  # {code}_chg5
+        ])
 
-    # 45th feature: DJI_RollVol20 (or calendar day-of-week if named in macro_cols)
-    dji_df = mkt.get(primary_sym)
-    feat_map["DJI_RollVol20"] = (
-        float(dji_df["Close"].pct_change().shift(1).rolling(20).std().iloc[-1])
-        if dji_df is not None and len(dji_df) >= 25
-        else 0.01
-    )
+    # Col 44 (45th feature in Cell [41]): news_roll3
+    vals.append(float(news_roll3_val))
 
-    saved_macro_cols = (
-        list(getattr(scaler_macro, "feature_names_in_", []))
-        or (tfidf_obj.get("macro_cols", []) if isinstance(tfidf_obj, dict) else [])
-    )
-
-    if saved_macro_cols and len(saved_macro_cols) == macro_dim:
-        row = []
-        for idx, c in enumerate(saved_macro_cols):
-            if c in feat_map and np.isfinite(feat_map[c]):
-                row.append(feat_map[c])
-            elif hasattr(scaler_macro, "mean_"):
-                row.append(float(scaler_macro.mean_[idx]))
-            else:
-                row.append(0.0)
-        raw_arr = np.array(row, dtype=np.float32).reshape(1, -1)
-    else:
-        ordered_vals = list(feat_map.values())
-        base = (
-            scaler_macro.mean_.copy().astype(np.float32)
-            if hasattr(scaler_macro, "mean_") and len(scaler_macro.mean_) == macro_dim
-            else np.zeros(macro_dim, dtype=np.float32)
-        )
-        for i, val in enumerate(ordered_vals[:macro_dim]):
-            if np.isfinite(val):
-                base[i] = float(val)
-        raw_arr = base.reshape(1, -1)
-
-    if hasattr(scaler_macro, "feature_names_in_"):
-        raw_in = pd.DataFrame(raw_arr, columns=scaler_macro.feature_names_in_)
-    else:
-        raw_in = raw_arr
-
-    x_macro_s = scaler_macro.transform(raw_in).astype(np.float32)
-    return np.clip(np.nan_to_num(x_macro_s, nan=0.0), -4.5, 4.5)
+    x_macro_raw = np.nan_to_num(np.array(vals, dtype=np.float32), nan=0.0).reshape(1, -1)
+    x_macro_s = np.clip(scaler_macro.transform(x_macro_raw), -5.0, 5.0).astype(np.float32)
+    return x_macro_s
 
 
-# 5. Real-Time Forward Pass Through Two-Tower MultimodalMarketNet + GBDT + Meta-Stacker
-def predict_for_index(ticker: str, x_macro_s: np.ndarray, x_news_s: np.ndarray) -> list[float]:
-    # A. PyTorch Two-Tower Cross-Attention Forward Pass
+# 5. Real-Time Inference via Two-Tower MultimodalMarketNet + GBDT + Meta-Stacker
+def predict_regime(ticker: str, x_macro_s: np.ndarray, x_news_s: np.ndarray) -> list[float]:
+    if regional_ensembles is not None and ticker in regional_ensembles:
+        pack = regional_ensembles[ticker]
+        xm = x_macro_s.copy()
+        if pack["mask_cols"]:
+            xm[:, pack["mask_cols"]] = 0.0
+        with torch.no_grad():
+            logits = pack["nn"](torch.tensor(xm), torch.tensor(x_news_s))
+            nn_p = F.softmax(logits, dim=-1).cpu().numpy()
+        gbdt_p = pack["gbdt"].predict_proba(np.hstack([xm, x_news_s]))
+        # Exact Cell [43] stacking order: [nn_probs, gbdt_probs]
+        meta_in = np.hstack([nn_p, gbdt_p])
+        return pack["meta"].predict_proba(meta_in)[0].tolist()
+
+    # Standalone artifacts fallback (multimodal_market_net.pt + gbdt_model.pkl + meta_stacker_clf.pkl)
     with torch.no_grad():
-        t_m = torch.tensor(x_macro_s, dtype=torch.float32)
-        t_n = torch.tensor(x_news_s, dtype=torch.float32)
-        nn_logits = pytorch_model(t_m, t_n)
-        nn_probs = F.softmax(nn_logits, dim=-1).cpu().numpy()  # (1, 3)
+        logits = pytorch_model(torch.tensor(x_macro_s), torch.tensor(x_news_s))
+        nn_probs = F.softmax(logits, dim=-1).cpu().numpy()
 
-    # B. GBDT Base Learner Forward Pass
     x_full = np.hstack([x_macro_s, x_news_s])
-    gbdt_dim = int(getattr(gbdt_model, "n_features_in_", x_full.shape[1]))
-    gbdt_in = x_full[:, :gbdt_dim]
-    if hasattr(gbdt_model, "feature_names_in_"):
-        gbdt_in = pd.DataFrame(gbdt_in, columns=gbdt_model.feature_names_in_)
-    gbdt_probs = gbdt_model.predict_proba(gbdt_in)  # (1, 3)
+    gbdt_probs = gbdt_model.predict_proba(x_full)
 
-    # C. If trained per-index regional heads exist (from updated Cell [35]), use the exact index head
-    if isinstance(regional_heads, dict) and ticker in regional_heads:
-        reg_in = np.hstack([nn_probs, gbdt_probs, x_news_s, x_macro_s])
-        return regional_heads[ticker].predict_proba(reg_in)[0].tolist()
-
-    # D. Meta-Stacker Classifier Forward Pass ([gbdt_probs, nn_probs])
-    stacked = np.hstack([gbdt_probs, nn_probs])
-    meta_dim = int(getattr(meta_clf, "n_features_in_", stacked.shape[1]))
-    if meta_dim == stacked.shape[1]:
-        meta_in = stacked
-    elif meta_dim < stacked.shape[1]:
-        meta_in = stacked[:, :meta_dim]
-    else:
-        ext = np.hstack([stacked, x_full])
-        meta_in = ext[:, :meta_dim]
-
-    if hasattr(meta_clf, "feature_names_in_"):
-        meta_in = pd.DataFrame(meta_in, columns=meta_clf.feature_names_in_)
-
+    # Cell [43] trained meta_clf on [nn_probs, gbdt_probs]
+    meta_in = np.hstack([nn_probs, gbdt_probs])
     return meta_clf.predict_proba(meta_in)[0].tolist()
 
 
-# 6. Sidebar User Input & Real-Time Execution
+# 6. Streamlit UI
 st.sidebar.header("News Scenario Prompt")
 user_prompt = st.sidebar.text_area(
     "Enter custom headlines or market events (one per line):",
-    value=(
-        "Federal Reserve announces unexpected interest rate cut amid easing inflation.\n"
-        "China reports stronger than expected manufacturing GDP growth and stimulus."
-    ),
+    value="Earthquake destroys Silicon Valley causing severe losses.",
     height=180,
 )
 
@@ -540,12 +362,12 @@ predict_btn = st.sidebar.button("Predict Across All Indices")
 if predict_btn:
     headlines = [h.strip() for h in user_prompt.split("\n") if h.strip()]
     if not headlines:
-        st.warning("Please enter at least one headline in the sidebar.")
+        st.warning("Please enter at least one headline.")
         st.stop()
 
-    with st.spinner("Running FinBERT + VADER + TF-IDF Anchors, fetching live yfinance/FRED macro series, and executing Two-Tower MultimodalMarketNet..."):
-        mkt_data, fred_data = fetch_live_macro_and_market()
-        x_news_s, diag = build_exact_22d_news_features(headlines)
+    with st.spinner("Running FinBERT (yiyanghkust/finbert-tone) + TF-IDF Anchors + Two-Tower MultimodalMarketNet..."):
+        mkt_data, fred_data = fetch_market_and_fred()
+        x_news_s, news_col12, diag = build_news_features_cell41(headlines)
 
         indices = [
             ("Dow Jones (^DJI)", "^DJI"),
@@ -555,10 +377,12 @@ if predict_btn:
         ]
 
         results = []
-        for label, sym in indices:
-            x_macro_s = build_exact_45d_macro_features(mkt_data, fred_data, focus_sym=sym)
-            probs = predict_for_index(sym, x_macro_s, x_news_s)
-            results.append((label, probs))
+        for idx_label, sym in indices:
+            x_macro_s = build_macro_features_cell40(
+                mkt_data, fred_data, news_roll3_val=news_col12, focus_sym=sym
+            )
+            probs = predict_regime(sym, x_macro_s, x_news_s)
+            results.append((idx_label, probs))
 
     st.subheader("📊 Independent Regional Index Predictions")
     cols = st.columns(4)
@@ -578,12 +402,9 @@ if predict_btn:
             st.bar_chart(prob_df, height=200)
 
     st.markdown("---")
-    fb_tag = "ProsusAI/finbert Active" if diag["finbert_active"] else "VADER Fallback (install `transformers` for FinBERT)"
     st.success(
-        f"Live Multimodal Inference Complete ({fb_tag}) | "
-        f"FinBERT Net Polarity: `{diag['fb_net']:+.3f}` | "
-        f"VADER Compound: `{diag['vader_comp']:+.3f}` | "
-        f"TF-IDF Anchor Spread (Up−Down): `{diag['tfidf_spread']:+.4f}`"
+        f"Executed `yiyanghkust/finbert-tone` + `MultimodalMarketNet` + `LightGBM` + `Meta-Stacker` | "
+        f"FinBERT `[Neu: {diag['fb_neu']:.3f}, Pos: {diag['fb_pos']:.3f}, Neg: {diag['fb_neg']:.3f}, Net: {diag['fb_net']:+.3f}]`"
     )
 else:
     st.info("👈 Type or paste your custom news headlines in the sidebar and click **Predict Across All Indices**.")
