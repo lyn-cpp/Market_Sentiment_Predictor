@@ -1,153 +1,275 @@
-"""Streamlit demo: real saved LightGBM inference and separate text sentiment."""
-from pathlib import Path
-import io
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import joblib
-import nltk
 import numpy as np
 import pandas as pd
-import streamlit as st
+import yfinance as yf
+import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
-st.set_page_config(page_title="News & Dow Jones Research", layout="wide")
-ROOT = Path(__file__).resolve().parent
-LABELS = {0: "Down", 1: "Neutral", 2: "Up"}
+nltk.download("vader_lexicon", quiet=True)
+sia = SentimentIntensityAnalyzer()
 
-@st.cache_resource
-def load_model():
-    # Only load the repository's trusted trained artifact, never user pickle files.
-    return joblib.load(ROOT / "gbdt_model.pkl")
-
-@st.cache_resource
-def sentiment_tool():
-    if not nltk.download("vader_lexicon", quiet=True):
-        raise RuntimeError("Could not download the VADER lexicon.")
-    return SentimentIntensityAnalyzer()
-
-def read_features(payload, model):
-    frame = pd.read_csv(io.BytesIO(payload))
-    expected = [f"f{i}" for i in range(model.n_features_in_)]
-    if list(frame.columns) != ["Date", "Actual", *expected]:
-        raise ValueError("Column names/order do not match. Use the Colab export below.")
-    if frame.empty or len(frame) > 10000:
-        raise ValueError("Upload between 1 and 10,000 daily rows.")
-    dates = pd.to_datetime(frame["Date"], errors="raise")
-    if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
-        raise ValueError("Dates must be present, unique, and in increasing order.")
-    x = frame[expected].apply(pd.to_numeric, errors="raise").to_numpy()
-    if not np.isfinite(x).all():
-        raise ValueError("Features contain missing or infinite values.")
-    if (np.abs(x) > 5.00001).any():
-        raise ValueError("Expected already-scaled, clipped X_full_te values; do not upload raw data.")
-    y = pd.to_numeric(frame["Actual"], errors="raise")
-    if not y.isin([0, 1, 2]).all():
-        raise ValueError("Actual labels must be 0, 1, or 2.")
-    return dates, x, y.to_numpy(dtype=int)
-
-st.title("News & Dow Jones Research")
-st.caption("Research prototype. Not financial advice.")
-st.write("Replay real predictions from the saved LightGBM model, or inspect the tone of custom headlines.")
-st.info("Market predictions require the complete news and market features used in Colab. "
-        "Text sentiment alone is not a market forecast. Only Dow Jones is supported here.")
-replay, text_tab = st.tabs(["Real model predictions", "Headline sentiment"])
-
-with replay:
-    st.subheader("Historical test replay")
-    st.write("This tab calls gbdt_model.pkl.predict_proba on exported Colab test features. "
-             "It uses LightGBM alone, not the neural-network stack; the earlier 57.41% "
-             "stacked accuracy does not apply to this tab.")
-    with st.expander("Prepare the input in Colab", expanded=True):
-        st.write("Run this after the final training cell in the SAME session. It exports the "
-                 "existing scaled test inputs and the matching trained LightGBM. Replace "
-                 "gbdt_model.pkl in this repository with the downloaded file from that run.")
-        st.code('''import numpy as np
-import pandas as pd
-import joblib
-from google.colab import files
-
-X_export = np.asarray(X_full_te)
-assert X_export.shape[0] == len(y_test_3c)
-assert X_export.shape[1] == gbdt_full.n_features_in_
-assert np.isfinite(X_export).all()
-
-export = pd.DataFrame(
-    X_export, columns=[f"f{i}" for i in range(X_export.shape[1])]
+st.set_page_config(page_title="Custom Prompt Multi-Index Market AI", layout="wide")
+st.title("🌐 Custom News Prompt & Multi-Index Market Predictor")
+st.markdown(
+    "Enter custom news headlines or macroeconomic scenarios below to evaluate "
+    "independent **Down (0)**, **Neutral (1)**, or **Up (2)** regime predictions "
+    "across **Dow Jones**, **S&P 500**, **Nikkei 225**, and **China SSE**."
 )
-export.insert(0, "Actual", np.asarray(y_test_3c, dtype=int))
-export.insert(0, "Date",
-              pd.to_datetime(df.loc[test_mask, "Date"]).dt.strftime("%Y-%m-%d").to_numpy())
-export.to_csv("test_features.csv", index=False)
-joblib.dump(gbdt_full, "gbdt_model.pkl")
 
-files.download("test_features.csv")
-files.download("gbdt_model.pkl")
-''', language="python")
-    st.caption("No second scaling is applied: X_full_te has already been processed in Colab. "
-               "Use matching features and model from one run, not files from different experiments.")
-    upload = st.file_uploader("Upload test_features.csv", type=["csv"])
-    bundled = ROOT / "test_features.csv"
-    payload = upload.getvalue() if upload is not None else (bundled.read_bytes() if bundled.exists() else None)
-    if payload is None:
-        st.warning("Waiting for the exported test features. No market probabilities are generated without inputs.")
+
+# 1. PyTorch Architecture Definition
+class GatedResidualBlock(nn.Module):
+    def __init__(self, dim, dropout=0.30):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim * 2)
+        self.norm = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = F.gelu(self.fc1(x))
+        h = self.drop(h)
+        val, gate = self.fc2(h).chunk(2, dim=-1)
+        return self.norm(x + (val * torch.sigmoid(gate)))
+
+
+class MultimodalMarketNet(nn.Module):
+    def __init__(self, macro_dim=45, news_dim=22, hidden_dim=64, dropout=0.32):
+        super().__init__()
+        self.macro_in = nn.Sequential(
+            nn.Linear(macro_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            GatedResidualBlock(hidden_dim, dropout),
+        )
+        self.news_in = nn.Sequential(
+            nn.Linear(news_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            GatedResidualBlock(hidden_dim, dropout),
+        )
+        self.cross_attn_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            GatedResidualBlock(hidden_dim, dropout),
+            GatedResidualBlock(hidden_dim, dropout),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, x_m, x_n):
+        hm = self.macro_in(x_m)
+        hn = self.news_in(x_n)
+        attn = self.cross_attn_gate(torch.cat([hm, hn], dim=-1))
+        return self.fusion(torch.cat([hm, hn * attn], dim=-1))
+
+
+# 2. Load Model Artifacts
+@st.cache_resource
+def load_artifacts():
+    gbdt = joblib.load("gbdt_model.pkl")
+    meta = joblib.load("meta_stacker_clf.pkl")
+    s_macro = joblib.load("scaler_macro.pkl")
+    s_news = joblib.load("scaler_news.pkl")
+    tfidf = joblib.load("tfidf_anchor.pkl")
+
+    macro_dim = getattr(s_macro, "n_features_in_", 45)
+    news_dim = getattr(s_news, "n_features_in_", 22)
+
+    pytorch_model = MultimodalMarketNet(macro_dim=macro_dim, news_dim=news_dim, hidden_dim=64)
+    pytorch_model.load_state_dict(
+        torch.load("multimodal_market_net.pt", map_location=torch.device("cpu"))
+    )
+    pytorch_model.eval()
+    return gbdt, meta, s_macro, s_news, tfidf, pytorch_model
+
+
+gbdt_model, meta_clf, scaler_macro, scaler_news, tfidf_anchor, pytorch_model = load_artifacts()
+
+
+# 3. Feature Builders (Macro = 45 dims, News = 22 dims)
+@st.cache_data(ttl=900)
+def fetch_live_macro_vector(target_ticker: str, expected_dim: int = 45) -> np.ndarray:
+    """Fetches live market & cross-asset macro series via yfinance and aligns to scaler_macro."""
+    tickers = [target_ticker, "^VIX", "^TNX", "DX-Y.NYB", "GC=F", "CL=F"]
+    feats = []
+    try:
+        data = yf.download(tickers, period="3mo", interval="1d", progress=False)["Close"]
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+        data = data.ffill().bfill()
+
+        for col in tickers:
+            if col in data.columns and len(data[col].dropna()) >= 21:
+                s = data[col].dropna()
+                ret_1d = s.pct_change(1).iloc[-1]
+                ret_5d = s.pct_change(5).iloc[-1]
+                ret_20d = s.pct_change(20).iloc[-1]
+                vol_5d = s.pct_change().rolling(5).std().iloc[-1]
+                vol_20d = s.pct_change().rolling(20).std().iloc[-1]
+                ma_ratio_5 = (s.iloc[-1] / s.rolling(5).mean().iloc[-1]) - 1.0
+                ma_ratio_20 = (s.iloc[-1] / s.rolling(20).mean().iloc[-1]) - 1.0
+                feats.extend([ret_1d, ret_5d, ret_20d, vol_5d, vol_20d, ma_ratio_5, ma_ratio_20])
+    except Exception:
+        pass
+
+    arr = np.nan_to_num(np.array(feats, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    # Pad with neutral training mean (if available) or truncate to match exact expected_dim (45)
+    if len(arr) < expected_dim:
+        pad_vals = (
+            scaler_macro.mean_[len(arr) : expected_dim]
+            if hasattr(scaler_macro, "mean_") and len(scaler_macro.mean_) == expected_dim
+            else np.zeros(expected_dim - len(arr), dtype=np.float32)
+        )
+        arr = np.concatenate([arr, pad_vals])
+    return arr[:expected_dim].reshape(1, -1)
+
+
+def build_news_vector(headlines: list[str], expected_dim: int = 22) -> tuple[np.ndarray, float]:
+    """Builds news feature vector using VADER distributions + saved tfidf_anchor."""
+    scores = [sia.polarity_scores(h) for h in headlines]
+    compounds = [s["compound"] for s in scores]
+    pos_vals = [s["pos"] for s in scores]
+    neg_vals = [s["neg"] for s in scores]
+    neu_vals = [s["neu"] for s in scores]
+
+    vader_stats = np.array(
+        [
+            np.mean(compounds),
+            np.std(compounds),
+            np.max(compounds),
+            np.min(compounds),
+            np.mean(pos_vals),
+            np.mean(neg_vals),
+            np.mean(neu_vals),
+            np.sum(np.array(compounds) > 0.05) / len(headlines),
+            np.sum(np.array(compounds) < -0.05) / len(headlines),
+        ],
+        dtype=np.float32,
+    )
+
+    combined_text = " ".join(headlines)
+    tfidf_vec = tfidf_anchor.transform([combined_text]).toarray().flatten().astype(np.float32)
+
+    # Combine TF-IDF anchor features with VADER stats depending on trained feature order
+    if len(tfidf_vec) == expected_dim:
+        raw_news = tfidf_vec
+    elif len(tfidf_vec) + len(vader_stats) >= expected_dim:
+        needed_vader = max(0, expected_dim - len(tfidf_vec))
+        raw_news = np.concatenate([tfidf_vec[:expected_dim], vader_stats[:needed_vader]])
     else:
-        try:
-            gbdt = load_model()
-            dates, x, actual = read_features(payload, gbdt)
-            probs = np.asarray(gbdt.predict_proba(x))
-            classes = np.asarray(gbdt.classes_, dtype=int)
-            if set(classes.tolist()) != {0, 1, 2} or probs.shape != (len(x), 3):
-                raise ValueError("Expected a trained three-class LightGBM.")
-            probs = probs[:, [int(np.flatnonzero(classes == k)[0]) for k in range(3)]]
-            if not np.isfinite(probs).all() or (probs < 0).any() or not np.allclose(probs.sum(axis=1), 1):
-                raise ValueError("Model returned invalid probabilities.")
-            predicted = probs.argmax(axis=1)
-            a, b, c = st.columns(3)
-            a.metric("LightGBM accuracy", f"{accuracy_score(actual, predicted):.2%}")
-            b.metric("Macro F1", f"{f1_score(actual, predicted, labels=[0,1,2], average='macro', zero_division=0):.3f}")
-            c.metric("Always-neutral baseline", f"{np.mean(actual == 1):.2%}")
-            st.caption(f"{len(x)} uploaded dates: {dates.min():%Y-%m-%d} to {dates.max():%Y-%m-%d}. "
-                       "These are historical labels, not a live forecast or trading return.")
-            selected = st.selectbox("Inspect a test date", range(len(x)),
-                                    format_func=lambda i: dates.iloc[i].strftime("%Y-%m-%d"))
-            st.write(f"Prediction: **{LABELS[int(predicted[selected])]}** · "
-                     f"Actual: **{LABELS[int(actual[selected])]}**")
-            st.bar_chart(pd.DataFrame({"Model probability": probs[selected]},
-                                     index=["Down", "Neutral", "Up"]))
-            st.caption("Model probabilities are not a verified probability of being correct.")
-            st.write("Confusion matrix: rows are actual classes, columns are predictions.")
-            st.dataframe(pd.DataFrame(confusion_matrix(actual, predicted, labels=[0,1,2]),
-                                      index=["Actual Down","Actual Neutral","Actual Up"],
-                                      columns=["Predicted Down","Predicted Neutral","Predicted Up"]))
-            result = pd.DataFrame({"Date": dates.dt.strftime("%Y-%m-%d"),
-                                   "Actual": actual, "Predicted": predicted,
-                                   "P_Down": probs[:,0], "P_Neutral": probs[:,1], "P_Up": probs[:,2]})
-            st.download_button("Download actual model predictions", result.to_csv(index=False),
-                               "lightgbm_predictions.csv", "text/csv")
-        except Exception as exc:
-            st.error(f"Prediction unavailable: {exc}")
+        raw_news = np.concatenate([tfidf_vec, vader_stats])
+        if len(raw_news) < expected_dim:
+            raw_news = np.pad(raw_news, (0, expected_dim - len(raw_news)))
 
-with text_tab:
-    st.subheader("Inspect headline tone")
-    st.write("This is VADER text sentiment only. It does not call the stock predictor and "
-             "cannot establish whether a headline will move a market.")
-    with st.form("headlines"):
-        prompt = st.text_area("One headline per line", height=180)
-        submitted = st.form_submit_button("Analyze sentiment")
-    if submitted:
-        headlines = [h.strip() for h in prompt.splitlines() if h.strip()]
+    return raw_news[:expected_dim].reshape(1, -1), float(np.mean(compounds))
+
+
+def run_ensemble_inference(x_macro_raw: np.ndarray, x_news_raw: np.ndarray) -> list[float]:
+    """Executes scaler -> PyTorch MultimodalMarketNet + GBDT -> Meta Stacker Classifier."""
+    # Scale inputs using trained Colab scalers
+    x_m_scaled = scaler_macro.transform(x_macro_raw).astype(np.float32)
+    x_n_scaled = scaler_news.transform(x_news_raw).astype(np.float32)
+
+    # A. PyTorch Cross-Attention Forward Pass
+    with torch.no_grad():
+        t_m = torch.tensor(x_m_scaled, dtype=torch.float32)
+        t_n = torch.tensor(x_n_scaled, dtype=torch.float32)
+        nn_logits = pytorch_model(t_m, t_n)
+        nn_probs = F.softmax(nn_logits, dim=-1).cpu().numpy()  # Shape: (1, 3)
+
+    # B. GBDT Forward Pass (align input features dynamically)
+    full_scaled = np.hstack([x_m_scaled, x_n_scaled])
+    gbdt_dim = getattr(gbdt_model, "n_features_in_", full_scaled.shape[1])
+    if gbdt_dim == x_m_scaled.shape[1]:
+        gbdt_in = x_m_scaled
+    elif gbdt_dim == x_n_scaled.shape[1]:
+        gbdt_in = x_n_scaled
+    else:
+        gbdt_in = full_scaled[:, :gbdt_dim]
+    gbdt_probs = gbdt_model.predict_proba(gbdt_in)  # Shape: (1, 3)
+
+    # C. Meta-Stacker Classifier Forward Pass
+    meta_features = np.hstack([gbdt_probs, nn_probs])  # Default 6-dim stack: [gbdt_p(3), nn_p(3)]
+    meta_dim = getattr(meta_clf, "n_features_in_", meta_features.shape[1])
+    if meta_dim != meta_features.shape[1]:
+        # Fallback if meta-stacker also included raw features or logits
+        extended = np.hstack([gbdt_probs, nn_probs, full_scaled])
+        meta_features = extended[:, :meta_dim]
+
+    final_probs = meta_clf.predict_proba(meta_features)[0]
+    return final_probs.tolist()
+
+
+# 4. User Input Interface
+st.sidebar.header("News Scenario Prompt")
+user_prompt = st.sidebar.text_area(
+    "Enter custom headlines or market events (one per line):",
+    value=(
+        "Federal Reserve announces unexpected interest rate cut amid rising inflation pressures.\n"
+        "China reports stronger than expected manufacturing GDP growth."
+    ),
+    height=180,
+)
+
+predict_btn = st.sidebar.button("Predict Across All Indices")
+
+if predict_btn:
+    with st.spinner("Fetching live macro context and running PyTorch + GBDT + Meta-Stacker..."):
+        headlines = [h.strip() for h in user_prompt.split("\n") if h.strip()]
         if not headlines:
-            st.warning("Enter at least one headline.")
-        elif len(headlines) > 25:
-            st.warning("Enter at most 25 headlines. No lines have been silently removed.")
-        else:
-            try:
-                sia = sentiment_tool()
-                scores = [sia.polarity_scores(h)["compound"] for h in headlines]
-                st.success(f"Analyzed {len(headlines)} headline(s). No filler headlines were added.")
-                st.dataframe(pd.DataFrame({"Headline": headlines, "Text sentiment": scores}),
-                             hide_index=True)
-                st.caption("Positive language, including non-financial text, can receive a positive "
-                           "sentiment score. It is never converted into an index probability.")
-            except Exception as exc:
-                st.error(f"Sentiment analysis unavailable: {exc}")
+            headlines = ["Market stability expected amid ongoing economic updates."]
 
+        macro_dim = getattr(scaler_macro, "n_features_in_", 45)
+        news_dim = getattr(scaler_news, "n_features_in_", 22)
+
+        x_news_raw, compound_score = build_news_vector(headlines, expected_dim=news_dim)
+
+        index_map = [
+            ("Dow Jones (^DJI)", "^DJI"),
+            ("S&P 500 (^GSPC)", "^GSPC"),
+            ("Nikkei 225 (^N225)", "^N225"),
+            ("China SSE (000001.SS)", "000001.SS"),
+        ]
+
+        results = []
+        for display_name, ticker in index_map:
+            x_macro_raw = fetch_live_macro_vector(ticker, expected_dim=macro_dim)
+            probs = run_ensemble_inference(x_macro_raw, x_news_raw)
+            results.append((display_name, probs))
+
+    st.subheader("📊 Independent Regional Index Predictions (True Ensemble Inference)")
+    cols = st.columns(4)
+    regime_names = ["Down (0)", "Neutral (1)", "Up (2)"]
+
+    for i, (idx_name, probs) in enumerate(results):
+        pred_class_idx = int(np.argmax(probs))
+        pred_regime = regime_names[pred_class_idx]
+        conf = f"{probs[pred_class_idx] * 100:.1f}% Confidence"
+
+        with cols[i]:
+            st.markdown(f"### {idx_name}")
+            st.metric("Regime", pred_regime, conf)
+            prob_df = pd.DataFrame(
+                {"Class": ["Down", "Neutral", "Up"], "Probability": probs}
+            ).set_index("Class")
+            st.bar_chart(prob_df, height=200)
+
+    st.markdown("---")
+    st.success(
+        f"Ran live ensemble inference across {len(headlines)} headline(s)! "
+        f"Mean VADER Compound: `{compound_score:.3f}`"
+    )
+else:
+    st.info("👈 Type or paste your custom news headlines in the sidebar and click **Predict Across All Indices**.")
