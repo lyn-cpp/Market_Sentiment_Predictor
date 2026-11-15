@@ -1,4 +1,4 @@
-import re
+import os
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -9,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from sklearn.metrics.pairwise import cosine_similarity
 
 nltk.download("vader_lexicon", quiet=True)
 sia = SentimentIntensityAnalyzer()
@@ -17,12 +18,12 @@ st.set_page_config(page_title="Custom Prompt Multi-Index Market AI", layout="wid
 st.title("🌐 Custom News Prompt & Multi-Index Market Predictor")
 st.markdown(
     "Enter custom news headlines or macroeconomic scenarios below to evaluate "
-    "independent **Down (0)**, **Neutral (1)**, or **Up (2)** regime predictions "
+    "real-time **Down (0)**, **Neutral (1)**, or **Up (2)** regime predictions "
     "across **Dow Jones**, **S&P 500**, **Nikkei 225**, and **China SSE**."
 )
 
 
-# 1. PyTorch Architecture Definition (Matches multimodal_market_net.pt)
+# 1. Two-Tower Cross-Attention Architecture (Exact match to kaggle.ipynb)
 class GatedResidualBlock(nn.Module):
     def __init__(self, dim, dropout=0.30):
         super().__init__()
@@ -76,414 +77,477 @@ class MultimodalMarketNet(nn.Module):
         return self.fusion(torch.cat([hm, hn * attn], dim=-1))
 
 
-# 2. Load Colab Artifacts
+# 2. Load Trained Model Artifacts & FinBERT
+@st.cache_resource
+def load_finbert():
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+        tok = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        mdl = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        mdl.eval()
+        return tok, mdl
+    except Exception:
+        return None, None
+
+
 @st.cache_resource
 def load_artifacts():
     gbdt = joblib.load("gbdt_model.pkl")
     meta = joblib.load("meta_stacker_clf.pkl")
     s_macro = joblib.load("scaler_macro.pkl")
     s_news = joblib.load("scaler_news.pkl")
-    tfidf = joblib.load("tfidf_anchor.pkl")
+    tfidf_raw = joblib.load("tfidf_anchor.pkl")
+    reg_heads = joblib.load("regional_heads.pkl") if os.path.exists("regional_heads.pkl") else None
 
-    macro_dim = getattr(s_macro, "n_features_in_", 45)
-    news_dim = getattr(s_news, "n_features_in_", 22)
+    macro_dim = int(getattr(s_macro, "n_features_in_", 45))
+    news_dim = int(getattr(s_news, "n_features_in_", 22))
 
     pytorch_model = MultimodalMarketNet(macro_dim=macro_dim, news_dim=news_dim, hidden_dim=64)
-    state = torch.load("multimodal_market_net.pt", map_location=torch.device("cpu"))
-    pytorch_model.load_state_dict(state)
+    state_dict = torch.load("multimodal_market_net.pt", map_location=torch.device("cpu"))
+    pytorch_model.load_state_dict(state_dict)
     pytorch_model.eval()
-    return gbdt, meta, s_macro, s_news, tfidf, pytorch_model
+
+    return gbdt, meta, s_macro, s_news, tfidf_raw, reg_heads, pytorch_model
 
 
-gbdt_model, meta_clf, scaler_macro, scaler_news, tfidf_anchor, pytorch_model = load_artifacts()
+finbert_tok, finbert_mdl = load_finbert()
+gbdt_model, meta_clf, scaler_macro, scaler_news, tfidf_obj, regional_heads, pytorch_model = load_artifacts()
 
 
-def get_feature_names(artifact, fallback_prefix: str, dim: int) -> list[str]:
-    if hasattr(artifact, "feature_names_in_"):
-        return [str(x) for x in artifact.feature_names_in_]
-    if hasattr(artifact, "feature_name_"):  # LightGBM native attribute
-        return [str(x) for x in artifact.feature_name_]
-    return [f"{fallback_prefix}_{i}" for i in range(dim)]
-
-
-# 3. Dynamic News Vector Builder (Maps directly to scaler_news schema + tfidf_anchor)
-def extract_tfidf_signals(headlines: list[str], tfidf_obj) -> dict[str, np.ndarray]:
-    """Handles TfidfVectorizer, Pipeline(TFIDF+SVD), or Dict(vectorizer + class anchors)."""
-    joined = " ".join(headlines)
-    out = {"vec": np.zeros(0, dtype=np.float32), "per_headline": None}
-
-    if isinstance(tfidf_obj, dict):
-        # Common Colab pattern: {"vectorizer": tfidf, "anchors": anchor_matrix, ...}
-        vec_model = (
-            tfidf_obj.get("vectorizer")
-            or tfidf_obj.get("tfidf")
-            or next((v for v in tfidf_obj.values() if hasattr(v, "transform")), None)
+# 3. Exact 22-Feature News Pipeline (FinBERT + VADER + TF-IDF Class Anchors + Topic Shares)
+def score_finbert(headlines: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns arrays of (p_pos, p_neg, p_neu) for each headline using ProsusAI/finbert."""
+    if finbert_tok is not None and finbert_mdl is not None:
+        inputs = finbert_tok(
+            headlines, padding=True, truncation=True, max_length=128, return_tensors="pt"
         )
-        if vec_model is not None:
-            mat = vec_model.transform(headlines)
-            joined_mat = vec_model.transform([joined])
-            anchors = (
-                tfidf_obj.get("anchors")
-                or tfidf_obj.get("centroids")
-                or tfidf_obj.get("anchor_vecs")
-            )
-            if anchors is not None:
-                anch_arr = anchors.toarray() if hasattr(anchors, "toarray") else np.asarray(anchors)
-                sims = (mat @ anch_arr.T)
-                sims = sims.toarray() if hasattr(sims, "toarray") else np.asarray(sims)
-                out["per_headline"] = sims.astype(np.float32)
-                out["vec"] = np.concatenate(
-                    [sims.mean(axis=0), sims.max(axis=0), sims.std(axis=0)]
-                ).astype(np.float32)
-            else:
-                arr = joined_mat.toarray().flatten() if hasattr(joined_mat, "toarray") else np.asarray(joined_mat).flatten()
-                out["vec"] = arr.astype(np.float32)
+        with torch.no_grad():
+            logits = finbert_mdl(**inputs).logits
+            probs = F.softmax(logits, dim=-1).cpu().numpy()
+        # ProsusAI/finbert label mapping: {0: positive, 1: negative, 2: neutral}
+        id2label = getattr(finbert_mdl.config, "id2label", {0: "positive", 1: "negative", 2: "neutral"})
+        pos_idx = next((k for k, v in id2label.items() if "pos" in v.lower()), 0)
+        neg_idx = next((k for k, v in id2label.items() if "neg" in v.lower()), 1)
+        neu_idx = next((k for k, v in id2label.items() if "neu" in v.lower()), 2)
+        return probs[:, pos_idx], probs[:, neg_idx], probs[:, neu_idx]
+
+    # Graceful fallback to calibrated VADER probabilities only if `transformers` isn't installed
+    vs = [sia.polarity_scores(h) for h in headlines]
+    p_pos = np.array([v["pos"] for v in vs], dtype=np.float32)
+    p_neg = np.array([v["neg"] for v in vs], dtype=np.float32)
+    p_neu = np.array([v["neu"] for v in vs], dtype=np.float32)
+    return p_pos, p_neg, p_neu
+
+
+def build_exact_22d_news_features(headlines: list[str]) -> tuple[np.ndarray, dict]:
+    """Builds the exact 22 news features engineered in Part 2 of kaggle.ipynb."""
+    news_dim = int(getattr(scaler_news, "n_features_in_", 22))
+
+    # A. FinBERT Headline Probabilities (9 features)
+    fb_pos, fb_neg, fb_neu = score_finbert(headlines)
+    fb_net = fb_pos - fb_neg
+
+    fb_pos_mean = float(np.mean(fb_pos))
+    fb_neg_mean = float(np.mean(fb_neg))
+    fb_neu_mean = float(np.mean(fb_neu))
+    fb_net_mean = float(np.mean(fb_net))
+    fb_net_std = float(np.std(fb_net)) if len(fb_net) > 1 else 0.0
+    fb_pos_max = float(np.max(fb_pos))
+    fb_neg_max = float(np.max(fb_neg))
+    fb_bull_ratio = float(np.mean(fb_net > 0.10))
+    fb_bear_ratio = float(np.mean(fb_net < -0.10))
+
+    # B. VADER Lexicon Features (7 features)
+    v_scores = [sia.polarity_scores(h) for h in headlines]
+    v_comp = np.array([s["compound"] for s in v_scores], dtype=np.float32)
+    v_pos = np.array([s["pos"] for s in v_scores], dtype=np.float32)
+    v_neg = np.array([s["neg"] for s in v_scores], dtype=np.float32)
+
+    vader_comp_mean = float(np.mean(v_comp))
+    vader_comp_std = float(np.std(v_comp)) if len(v_comp) > 1 else 0.0
+    vader_comp_min = float(np.min(v_comp))
+    vader_comp_max = float(np.max(v_comp))
+    vader_pos_mean = float(np.mean(v_pos))
+    vader_neg_mean = float(np.mean(v_neg))
+    vader_net = float(np.mean(v_comp > 0.05) - np.mean(v_comp < -0.05))
+
+    # C. TF-IDF Class-Anchor Cosine Similarity Features (4 features)
+    joined_doc = " ".join(headlines)
+    if isinstance(tfidf_obj, dict) and "vectorizer" in tfidf_obj:
+        vec = tfidf_obj["vectorizer"]
+        x_tf = vec.transform([joined_doc])
+        c0 = np.asarray(tfidf_obj["c0"]).reshape(1, -1)
+        c1 = np.asarray(tfidf_obj["c1"]).reshape(1, -1)
+        c2 = np.asarray(tfidf_obj["c2"]).reshape(1, -1)
+        sim_down = float(cosine_similarity(x_tf, c0)[0, 0])
+        sim_neu = float(cosine_similarity(x_tf, c1)[0, 0])
+        sim_up = float(cosine_similarity(x_tf, c2)[0, 0])
+        sim_spread = sim_up - sim_down
+        saved_news_cols = tfidf_obj.get("news_cols", [])
     elif hasattr(tfidf_obj, "transform"):
-        joined_mat = tfidf_obj.transform([joined])
-        arr = joined_mat.toarray().flatten() if hasattr(joined_mat, "toarray") else np.asarray(joined_mat).flatten()
-        out["vec"] = arr.astype(np.float32)
-        h_mat = tfidf_obj.transform(headlines)
-        out["per_headline"] = (h_mat.toarray() if hasattr(h_mat, "toarray") else np.asarray(h_mat)).astype(np.float32)
-
-    return out
-
-
-def build_news_dataframe(headlines: list[str]) -> tuple[pd.DataFrame, dict]:
-    """Constructs exact 22-column news feature row matched to scaler_news.feature_names_in_."""
-    news_dim = getattr(scaler_news, "n_features_in_", 22)
-    col_names = get_feature_names(scaler_news, "news", news_dim)
-
-    scores = [sia.polarity_scores(h) for h in headlines]
-    comp = np.array([s["compound"] for s in scores], dtype=np.float32)
-    pos = np.array([s["pos"] for s in scores], dtype=np.float32)
-    neg = np.array([s["neg"] for s in scores], dtype=np.float32)
-    neu = np.array([s["neu"] for s in scores], dtype=np.float32)
-    lengths = np.array([len(h.split()) for h in headlines], dtype=np.float32)
-    char_lens = np.array([len(h) for h in headlines], dtype=np.float32)
-
-    tfidf_info = extract_tfidf_signals(headlines, tfidf_anchor)
-    tfidf_vec = tfidf_info["vec"]
-
-    # Precompute candidate statistics commonly engineered in 22-dim news pipelines
-    bull_ratio = float(np.mean(comp > 0.05))
-    bear_ratio = float(np.mean(comp < -0.05))
-    net_breadth = bull_ratio - bear_ratio
-    comp_mean = float(np.mean(comp))
-    comp_std = float(np.std(comp)) if len(comp) > 1 else abs(comp_mean) * 0.25
-    comp_max = float(np.max(comp))
-    comp_min = float(np.min(comp))
-    comp_skew = float(comp_max + comp_min - 2 * np.median(comp))
-
-    has_real_names = hasattr(scaler_news, "feature_names_in_")
-    row = {}
-
-    if has_real_names:
-        tfidf_cursor = 0
-        for idx, col in enumerate(col_names):
-            c = col.lower()
-            if any(k in c for k in ["tfidf", "svd", "anchor", "topic", "emb", "sim", "cluster"]):
-                # Extract explicit index if present (e.g., tfidf_3 or anchor_2)
-                m = re.search(r"(\d+)$", c)
-                t_idx = int(m.group(1)) if m and int(m.group(1)) < len(tfidf_vec) else tfidf_cursor
-                val = float(tfidf_vec[t_idx]) if t_idx < len(tfidf_vec) else comp_mean
-                tfidf_cursor += 1
-            elif "comp" in c and "std" in c:
-                val = comp_std
-            elif "comp" in c and "max" in c:
-                val = comp_max
-            elif "comp" in c and "min" in c:
-                val = comp_min
-            elif "comp" in c or ("sent" in c and "std" not in c and "max" not in c and "min" not in c):
-                val = comp_mean
-            elif "pos" in c and "std" in c:
-                val = float(np.std(pos))
-            elif "pos" in c and "max" in c:
-                val = float(np.max(pos))
-            elif "pos" in c or "bull" in c:
-                val = bull_ratio if "ratio" in c or "pct" in c or "share" in c else float(np.mean(pos))
-            elif "neg" in c and "std" in c:
-                val = float(np.std(neg))
-            elif "neg" in c and "max" in c:
-                val = float(np.max(neg))
-            elif "neg" in c or "bear" in c:
-                val = bear_ratio if "ratio" in c or "pct" in c or "share" in c else float(np.mean(neg))
-            elif "neu" in c:
-                val = float(np.mean(neu))
-            elif "std" in c or "disp" in c or "vol" in c:
-                val = comp_std
-            elif "max" in c:
-                val = comp_max
-            elif "min" in c:
-                val = comp_min
-            elif "skew" in c or "asym" in c:
-                val = comp_skew
-            elif "net" in c or "diff" in c or "spread" in c or "pol" in c:
-                val = net_breadth
-            elif "word" in c or "len" in c:
-                val = float(np.mean(lengths)) if "word" in c else float(np.mean(char_lens))
-            elif "count" in c or "num" in c:
-                val = float(len(headlines))
-            else:
-                # Fallback to training mean shifted by sentiment if column name is opaque
-                base_m = float(scaler_news.mean_[idx]) if hasattr(scaler_news, "mean_") else 0.0
-                base_s = float(scaler_news.scale_[idx]) if hasattr(scaler_news, "scale_") else 1.0
-                val = base_m + comp_mean * base_s
-            row[col] = val
+        # Backward compatibility if old tfidf_anchor.pkl (raw TfidfVectorizer) is still on disk:
+        # Score bullish vs bearish vocabulary anchors directly inside the fitted TF-IDF space
+        x_tf = tfidf_obj.transform([joined_doc])
+        bull_anchor = tfidf_obj.transform(
+            ["surge rally growth cut recovery boom beat profit record stimulus gain"]
+        )
+        bear_anchor = tfidf_obj.transform(
+            ["crash recession crisis default inflation war plunge drop fear loss Cut"]
+        )
+        neu_anchor = tfidf_obj.transform(
+            ["steady unchanged hold report meeting session market index"]
+        )
+        sim_down = float(cosine_similarity(x_tf, bear_anchor)[0, 0])
+        sim_neu = float(cosine_similarity(x_tf, neu_anchor)[0, 0])
+        sim_up = float(cosine_similarity(x_tf, bull_anchor)[0, 0])
+        sim_spread = sim_up - sim_down
+        saved_news_cols = []
     else:
-        # No feature names saved in scaler_news: combine VADER stats FIRST + compact TF-IDF projection
-        core_vader = [
-            comp_mean,
-            comp_std,
-            comp_max,
-            comp_min,
-            float(np.mean(pos)),
-            float(np.mean(neg)),
-            float(np.mean(neu)),
-            bull_ratio,
-            bear_ratio,
-            net_breadth,
-            float(np.mean(lengths)),
-            float(len(headlines)),
-        ]
-        remaining = max(0, news_dim - len(core_vader))
-        if len(tfidf_vec) >= remaining and remaining > 0:
-            # Bin/average across the entire TF-IDF vector instead of slicing the first N zeros!
-            chunks = np.array_split(tfidf_vec, remaining)
-            tfidf_compact = [float(np.mean(ch)) if len(ch) else 0.0 for ch in chunks]
-        else:
-            tfidf_compact = list(tfidf_vec) + [0.0] * max(0, remaining - len(tfidf_vec))
-        combined = (core_vader + tfidf_compact)[:news_dim]
-        row = {col_names[i]: combined[i] for i in range(news_dim)}
+        sim_down, sim_neu, sim_up, sim_spread = 0.0, 0.0, 0.0, 0.0
+        saved_news_cols = []
 
-    df_news = pd.DataFrame([row], columns=col_names)
-    meta_stats = {
-        "compound_mean": comp_mean,
-        "pos_mean": float(np.mean(pos)),
-        "neg_mean": float(np.mean(neg)),
-        "tfidf_nonzero": int(np.count_nonzero(tfidf_vec)),
-        "tfidf_dim": int(len(tfidf_vec)),
+    # D. Macro / Geopolitical Keyword Intensity Features (2 features -> Total = 22)
+    low_doc = joined_doc.lower()
+    macro_kw = sum(
+        k in low_doc
+        for k in ["fed", "rate", "inflation", "gdp", "jobs", "cpi", "central bank", "stimulus", "yield"]
+    ) / max(len(headlines), 1)
+    risk_kw = sum(
+        k in low_doc
+        for k in ["war", "crisis", "crash", "sanction", "default", "recession", "tariff", "bankrupt"]
+    ) / max(len(headlines), 1)
+
+    feature_lookup = {
+        "fb_pos_mean": fb_pos_mean,
+        "fb_neg_mean": fb_neg_mean,
+        "fb_neu_mean": fb_neu_mean,
+        "fb_net_mean": fb_net_mean,
+        "fb_net_std": fb_net_std,
+        "fb_pos_max": fb_pos_max,
+        "fb_neg_max": fb_neg_max,
+        "fb_bull_ratio": fb_bull_ratio,
+        "fb_bear_ratio": fb_bear_ratio,
+        "vader_comp_mean": vader_comp_mean,
+        "vader_comp_std": vader_comp_std,
+        "vader_comp_min": vader_comp_min,
+        "vader_comp_max": vader_comp_max,
+        "vader_pos_mean": vader_pos_mean,
+        "vader_neg_mean": vader_neg_mean,
+        "vader_net": vader_net,
+        "tfidf_sim_down": sim_down,
+        "tfidf_sim_neu": sim_neu,
+        "tfidf_sim_up": sim_up,
+        "tfidf_sim_spread": sim_spread,
+        "macro_kw_intensity": float(macro_kw),
+        "risk_kw_intensity": float(risk_kw),
     }
-    return df_news, meta_stats
+
+    default_22 = list(feature_lookup.values())
+
+    # Map by exact column name if present in scaler_news or tfidf_bundle
+    target_cols = list(getattr(scaler_news, "feature_names_in_", [])) or saved_news_cols
+    if target_cols and len(target_cols) == news_dim:
+        vec = []
+        for idx, c in enumerate(target_cols):
+            cl = c.lower()
+            if c in feature_lookup:
+                vec.append(feature_lookup[c])
+            elif "finbert" in cl or cl.startswith("fb_"):
+                if "pos" in cl and "max" in cl:
+                    vec.append(fb_pos_max)
+                elif "neg" in cl and "max" in cl:
+                    vec.append(fb_neg_max)
+                elif "pos" in cl:
+                    vec.append(fb_pos_mean)
+                elif "neg" in cl:
+                    vec.append(fb_neg_mean)
+                elif "neu" in cl:
+                    vec.append(fb_neu_mean)
+                elif "std" in cl:
+                    vec.append(fb_net_std)
+                elif "bull" in cl:
+                    vec.append(fb_bull_ratio)
+                elif "bear" in cl:
+                    vec.append(fb_bear_ratio)
+                else:
+                    vec.append(fb_net_mean)
+            elif "vader" in cl:
+                if "std" in cl:
+                    vec.append(vader_comp_std)
+                elif "min" in cl:
+                    vec.append(vader_comp_min)
+                elif "max" in cl:
+                    vec.append(vader_comp_max)
+                elif "pos" in cl:
+                    vec.append(vader_pos_mean)
+                elif "neg" in cl:
+                    vec.append(vader_neg_mean)
+                elif "net" in cl or "diff" in cl:
+                    vec.append(vader_net)
+                else:
+                    vec.append(vader_comp_mean)
+            elif any(k in cl for k in ["tfidf", "anchor", "sim", "cent"]):
+                if "down" in cl or "0" in cl or "bear" in cl:
+                    vec.append(sim_down)
+                elif "up" in cl or "2" in cl or "bull" in cl:
+                    vec.append(sim_up)
+                elif "neu" in cl or "1" in cl:
+                    vec.append(sim_neu)
+                else:
+                    vec.append(sim_spread)
+            else:
+                vec.append(default_22[idx % len(default_22)])
+        raw_arr = np.array(vec, dtype=np.float32).reshape(1, -1)
+    else:
+        raw_arr = np.array(default_22[:news_dim], dtype=np.float32).reshape(1, -1)
+        if raw_arr.shape[1] < news_dim:
+            raw_arr = np.pad(raw_arr, ((0, 0), (0, news_dim - raw_arr.shape[1])))
+
+    if hasattr(scaler_news, "feature_names_in_"):
+        raw_in = pd.DataFrame(raw_arr, columns=scaler_news.feature_names_in_)
+    else:
+        raw_in = raw_arr
+
+    x_news_s = scaler_news.transform(raw_in).astype(np.float32)
+    x_news_s = np.clip(np.nan_to_num(x_news_s, nan=0.0), -4.5, 4.5)
+
+    diagnostics = {
+        "finbert_active": finbert_mdl is not None,
+        "fb_net": fb_net_mean,
+        "vader_comp": vader_comp_mean,
+        "tfidf_spread": sim_spread,
+    }
+    return x_news_s, diagnostics
 
 
-# 4. Live Macro Feature Builder (Maps directly to scaler_macro schema + Regional Index)
+# 4. Exact 45-Feature Live Market + FRED Pipeline (Matches Part 1 of kaggle.ipynb)
 @st.cache_data(ttl=900)
-def fetch_market_history() -> pd.DataFrame:
-    tickers = [
-        "^DJI", "^GSPC", "^IXIC", "^RUT", "^N225", "000001.SS", "^HSI", "^FTSE", "^GDAXI",
-        "^VIX", "^TNX", "^IRX", "^FVX", "DX-Y.NYB", "GC=F", "CL=F", "JPY=X", "CNY=X", "EURUSD=X",
-    ]
-    data = yf.download(tickers, period="6mo", interval="1d", progress=False)["Close"]
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
-    return data.ffill().bfill()
+def fetch_live_macro_and_market() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    tickers = ["^DJI", "^GSPC", "^N225", "000001.SS", "^VIX"]
+    mkt = {}
+    for sym in tickers:
+        try:
+            h = yf.Ticker(sym).history(period="6mo", interval="1d", auto_adjust=True)
+            if h is not None and not h.empty:
+                if getattr(h.index, "tz", None) is not None:
+                    h.index = h.index.tz_localize(None)
+                h.index = h.index.normalize()
+                mkt[sym] = h[["Open", "High", "Low", "Close", "Volume"]].ffill().bfill()
+        except Exception:
+            pass
+
+    # Fetch exact 5 FRED series from Part 1 directly from St. Louis Fed CSV endpoints (zero API key needed)
+    fred_codes = ["T10Y2Y", "BAA10Y", "DCOILWTICO", "DEXJPUS", "DEXCHUS"]
+    start_dt = (pd.Timestamp.today() - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+    fred_dict = {}
+    for code in fred_codes:
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}&cosd={start_dt}"
+            s = pd.read_csv(url, index_col=0, parse_dates=True).iloc[:, 0]
+            fred_dict[code] = pd.to_numeric(s, errors="coerce").ffill()
+        except Exception:
+            fred_dict[code] = pd.Series(dtype=float)
+
+    fred_df = pd.DataFrame(fred_dict).ffill().bfill()
+    return mkt, fred_df
 
 
-def build_macro_dataframe(target_ticker: str) -> pd.DataFrame:
-    macro_dim = getattr(scaler_macro, "n_features_in_", 45)
-    col_names = get_feature_names(scaler_macro, "macro", macro_dim)
-    hist = fetch_market_history()
+def build_exact_45d_macro_features(
+    mkt: dict[str, pd.DataFrame], fred_df: pd.DataFrame, focus_sym: str
+) -> np.ndarray:
+    """
+    Constructs the exact 45 market + FRED macro features from Part 1 of kaggle.ipynb.
+    When evaluating a non-DJI regional index (if regional_heads.pkl is not yet uploaded),
+    adapts the primary equity block to `focus_sym` so each index reflects its own live tape.
+    """
+    macro_dim = int(getattr(scaler_macro, "n_features_in_", 45))
+    feat_map = {}
 
-    s_target = hist[target_ticker].dropna() if target_ticker in hist.columns else pd.Series(dtype=float)
+    # Determine primary & secondary equity tickers
+    primary_sym = "^DJI" if regional_heads is not None else focus_sym
+    secondary_sym = "^GSPC" if primary_sym != "^GSPC" else "^DJI"
 
-    def series_stats(s: pd.Series) -> dict[str, float]:
-        if len(s) < 25:
-            return {"r1": 0.0, "r5": 0.0, "r20": 0.0, "v5": 0.01, "v20": 0.01, "ma5": 0.0, "ma20": 0.0, "rsi": 50.0, "lvl": 0.0}
-        ret = s.pct_change()
-        delta = s.diff()
-        gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
-        loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
-        rs = gain / (loss + 1e-9)
-        return {
-            "r1": float(ret.iloc[-1]),
-            "r5": float(s.pct_change(5).iloc[-1]),
-            "r20": float(s.pct_change(20).iloc[-1]),
-            "v5": float(ret.rolling(5).std().iloc[-1]),
-            "v20": float(ret.rolling(20).std().iloc[-1]),
-            "ma5": float((s.iloc[-1] / s.rolling(5).mean().iloc[-1]) - 1.0),
-            "ma20": float((s.iloc[-1] / s.rolling(20).mean().iloc[-1]) - 1.0),
-            "rsi": float(100.0 - (100.0 / (1.0 + rs))),
-            "lvl": float(s.iloc[-1]),
-        }
+    for sym, tag in [(primary_sym, "DJI"), (secondary_sym, "SPX")]:
+        df_s = mkt.get(sym)
+        if df_s is not None and len(df_s) >= 25:
+            c = df_s["Close"]
+            h = df_s["High"]
+            l = df_s["Low"]
+            o = df_s["Open"]
+            v = df_s["Volume"].replace(0, np.nan).ffill().fillna(1.0)
+            r = c.pct_change()
 
-    tgt = series_stats(s_target)
-    vix = series_stats(hist["^VIX"].dropna()) if "^VIX" in hist else tgt
-    tnx = series_stats(hist["^TNX"].dropna()) if "^TNX" in hist else tgt
-    dxy = series_stats(hist["DX-Y.NYB"].dropna()) if "DX-Y.NYB" in hist else tgt
-    gold = series_stats(hist["GC=F"].dropna()) if "GC=F" in hist else tgt
-    oil = series_stats(hist["CL=F"].dropna()) if "CL=F" in hist else tgt
+            r_lag1 = r.shift(1)
+            vol5 = float(r_lag1.rolling(5).std().iloc[-1])
+            vol20 = float(r_lag1.rolling(20).std().iloc[-1])
+            hl_range = (h - l) / (c + 1e-6)
+            vol_s1 = v.shift(1)
 
-    # Start from training mean so any unmapped macro indicator stays cleanly in-distribution (z-score = 0)
-    base_means = (
-        scaler_macro.mean_.copy().astype(np.float64)
-        if hasattr(scaler_macro, "mean_") and len(scaler_macro.mean_) == macro_dim
-        else np.zeros(macro_dim, dtype=np.float64)
+            feat_map[f"{tag}_ret_lag1"] = float(r.iloc[-2])
+            feat_map[f"{tag}_ret_lag2"] = float(r.iloc[-3])
+            feat_map[f"{tag}_ret_ma5"] = float(r_lag1.rolling(5).mean().iloc[-1])
+            feat_map[f"{tag}_ret_ma20"] = float(r_lag1.rolling(20).mean().iloc[-1])
+            feat_map[f"{tag}_vol_5d"] = vol5
+            feat_map[f"{tag}_vol_20d"] = vol20
+            feat_map[f"{tag}_vol_ratio"] = vol5 / (vol20 + 1e-6)
+            feat_map[f"{tag}_hl_range_lag1"] = float(hl_range.iloc[-2])
+            feat_map[f"{tag}_hl_range_ma5"] = float(hl_range.shift(1).rolling(5).mean().iloc[-1])
+            feat_map[f"{tag}_open_gap_t"] = float((o.iloc[-1] / (c.iloc[-2] + 1e-6)) - 1.0)
+            feat_map[f"{tag}_vol_z_lag1"] = float(
+                (vol_s1.iloc[-1] - vol_s1.rolling(20).mean().iloc[-1])
+                / (vol_s1.rolling(20).std().iloc[-1] + 1e-6)
+            )
+        else:
+            for sfx in [
+                "ret_lag1", "ret_lag2", "ret_ma5", "ret_ma20", "vol_5d", "vol_20d",
+                "vol_ratio", "hl_range_lag1", "hl_range_ma5", "open_gap_t", "vol_z_lag1",
+            ]:
+                feat_map[f"{tag}_{sfx}"] = 0.0
+
+    # VIX features (4 features -> running total: 26)
+    vix_df = mkt.get("^VIX")
+    if vix_df is not None and len(vix_df) >= 25:
+        vc = vix_df["Close"]
+        vo = vix_df["Open"]
+        feat_map["VIX_lag1"] = float(vc.iloc[-2])
+        feat_map["VIX_diff1"] = float(vc.diff().iloc[-2])
+        feat_map["VIX_ma_rat"] = float(vc.iloc[-2] / (vc.shift(1).rolling(20).mean().iloc[-1] + 1e-6))
+        feat_map["VIX_open_t"] = float(vo.iloc[-1] / (vc.iloc[-2] + 1e-6) - 1.0)
+    else:
+        feat_map.update({"VIX_lag1": 18.0, "VIX_diff1": 0.0, "VIX_ma_rat": 1.0, "VIX_open_t": 0.0})
+
+    # Pre-Market Asian Session Returns: Nikkei & SSE (8 features -> running total: 34)
+    for sym, tag in [("^N225", "NIKKEI"), ("000001.SS", "SSE")]:
+        adf = mkt.get(sym)
+        if adf is not None and len(adf) >= 15:
+            ar = adf["Close"].pct_change()
+            feat_map[f"{tag}_preUS_ret_t"] = float(ar.iloc[-1])
+            feat_map[f"{tag}_ret_lag1"] = float(ar.iloc[-2])
+            feat_map[f"{tag}_ret_ma5"] = float(ar.rolling(5).mean().iloc[-1])
+            feat_map[f"{tag}_vol_10d"] = float(ar.rolling(10).std().iloc[-1])
+        else:
+            feat_map.update(
+                {f"{tag}_preUS_ret_t": 0.0, f"{tag}_ret_lag1": 0.0, f"{tag}_ret_ma5": 0.0, f"{tag}_vol_10d": 0.01}
+            )
+
+    # FRED Macroeconomic Series: 5 codes x 2 (lag1, chg5) = 10 features -> running total: 44
+    for code in ["T10Y2Y", "BAA10Y", "DCOILWTICO", "DEXJPUS", "DEXCHUS"]:
+        s = fred_df[code].dropna() if code in fred_df.columns else pd.Series(dtype=float)
+        if len(s) >= 7:
+            feat_map[f"{code}_lag1"] = float(s.iloc[-2])
+            feat_map[f"{code}_chg5"] = float(s.iloc[-2] - s.iloc[-7])
+        else:
+            feat_map[f"{code}_lag1"] = 0.0
+            feat_map[f"{code}_chg5"] = 0.0
+
+    # 45th feature: DJI_RollVol20 (or calendar day-of-week if named in macro_cols)
+    dji_df = mkt.get(primary_sym)
+    feat_map["DJI_RollVol20"] = (
+        float(dji_df["Close"].pct_change().shift(1).rolling(20).std().iloc[-1])
+        if dji_df is not None and len(dji_df) >= 25
+        else 0.01
     )
+
+    saved_macro_cols = (
+        list(getattr(scaler_macro, "feature_names_in_", []))
+        or (tfidf_obj.get("macro_cols", []) if isinstance(tfidf_obj, dict) else [])
+    )
+
+    if saved_macro_cols and len(saved_macro_cols) == macro_dim:
+        row = []
+        for idx, c in enumerate(saved_macro_cols):
+            if c in feat_map and np.isfinite(feat_map[c]):
+                row.append(feat_map[c])
+            elif hasattr(scaler_macro, "mean_"):
+                row.append(float(scaler_macro.mean_[idx]))
+            else:
+                row.append(0.0)
+        raw_arr = np.array(row, dtype=np.float32).reshape(1, -1)
+    else:
+        ordered_vals = list(feat_map.values())
+        base = (
+            scaler_macro.mean_.copy().astype(np.float32)
+            if hasattr(scaler_macro, "mean_") and len(scaler_macro.mean_) == macro_dim
+            else np.zeros(macro_dim, dtype=np.float32)
+        )
+        for i, val in enumerate(ordered_vals[:macro_dim]):
+            if np.isfinite(val):
+                base[i] = float(val)
+        raw_arr = base.reshape(1, -1)
 
     if hasattr(scaler_macro, "feature_names_in_"):
-        row = {}
-        for i, col in enumerate(col_names):
-            c = col.lower()
-            src = tgt
-            if "vix" in c:
-                src = vix
-            elif any(k in c for k in ["tnx", "10y", "yield", "rate", "bond"]):
-                src = tnx
-            elif any(k in c for k in ["dxy", "usd", "dollar"]):
-                src = dxy
-            elif "gold" in c or "gc" in c:
-                src = gold
-            elif "oil" in c or "cl" in c or "wti" in c:
-                src = oil
-            elif "dji" in c and "^DJI" in hist:
-                src = series_stats(hist["^DJI"].dropna())
-            elif ("gspc" in c or "sp500" in c or "spx" in c) and "^GSPC" in hist:
-                src = series_stats(hist["^GSPC"].dropna())
-            elif ("n225" in c or "nikkei" in c) and "^N225" in hist:
-                src = series_stats(hist["^N225"].dropna())
-            elif ("sse" in c or "000001" in c or "china" in c) and "000001.SS" in hist:
-                src = series_stats(hist["000001.SS"].dropna())
+        raw_in = pd.DataFrame(raw_arr, columns=scaler_macro.feature_names_in_)
+    else:
+        raw_in = raw_arr
 
-            if "rsi" in c:
-                val = src["rsi"]
-            elif "vol" in c and "20" in c:
-                val = src["v20"]
-            elif "vol" in c:
-                val = src["v5"]
-            elif "ma" in c and "20" in c:
-                val = src["ma20"]
-            elif "ma" in c:
-                val = src["ma5"]
-            elif "20" in c:
-                val = src["r20"]
-            elif "5" in c:
-                val = src["r5"]
-            elif any(k in c for k in ["ret", "chg", "roc", "1d", "return"]):
-                val = src["r1"]
-            elif "vix" in c or "tnx" in c:
-                val = src["lvl"]
-            else:
-                val = float(base_means[i])
-            row[col] = val
-        return pd.DataFrame([row], columns=col_names).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    # Fallback if scaler_macro has no saved column names: populate first slots with index + cross-asset stats
-    raw_feats = [
-        tgt["r1"], tgt["r5"], tgt["r20"], tgt["v5"], tgt["v20"], tgt["ma5"], tgt["ma20"], tgt["rsi"],
-        vix["lvl"], vix["r1"], vix["r5"], tnx["lvl"], tnx["r1"], tnx["r5"],
-        dxy["r1"], dxy["r5"], gold["r1"], gold["r5"], oil["r1"], oil["r5"],
-    ]
-    vec = base_means.copy()
-    for idx, val in enumerate(raw_feats[:macro_dim]):
-        if np.isfinite(val):
-            vec[idx] = val
-    return pd.DataFrame([vec], columns=col_names)
+    x_macro_s = scaler_macro.transform(raw_in).astype(np.float32)
+    return np.clip(np.nan_to_num(x_macro_s, nan=0.0), -4.5, 4.5)
 
 
-# 5. True Ensemble Forward Pass (PyTorch + GBDT -> Meta-Stacker)
-def run_ensemble_inference(
-    df_macro: pd.DataFrame, df_news: pd.DataFrame, blend_mode: str = "Full Stacked Ensemble"
-) -> dict:
-    x_m_scaled = scaler_macro.transform(df_macro).astype(np.float32)
-    x_n_scaled = scaler_news.transform(df_news).astype(np.float32)
-
-    # Clip extreme out-of-distribution z-scores so single-headline scaling doesn't saturate LayerNorm/Trees
-    x_m_scaled = np.clip(np.nan_to_num(x_m_scaled, nan=0.0), -5.0, 5.0)
-    x_n_scaled = np.clip(np.nan_to_num(x_n_scaled, nan=0.0), -5.0, 5.0)
-
-    # 1) PyTorch MultimodalMarketNet Forward Pass
+# 5. Real-Time Forward Pass Through Two-Tower MultimodalMarketNet + GBDT + Meta-Stacker
+def predict_for_index(ticker: str, x_macro_s: np.ndarray, x_news_s: np.ndarray) -> list[float]:
+    # A. PyTorch Two-Tower Cross-Attention Forward Pass
     with torch.no_grad():
-        t_m = torch.tensor(x_m_scaled, dtype=torch.float32)
-        t_n = torch.tensor(x_n_scaled, dtype=torch.float32)
+        t_m = torch.tensor(x_macro_s, dtype=torch.float32)
+        t_n = torch.tensor(x_news_s, dtype=torch.float32)
         nn_logits = pytorch_model(t_m, t_n)
-        nn_probs = F.softmax(nn_logits, dim=-1).cpu().numpy()[0]
+        nn_probs = F.softmax(nn_logits, dim=-1).cpu().numpy()  # (1, 3)
 
-    # 2) GBDT Forward Pass (Align exact feature names if stored in gbdt_model)
-    combined_scaled_df = pd.DataFrame(
-        np.hstack([x_m_scaled, x_n_scaled]),
-        columns=list(df_macro.columns) + list(df_news.columns),
-    )
-    combined_raw_df = pd.concat([df_macro, df_news], axis=1)
+    # B. GBDT Base Learner Forward Pass
+    x_full = np.hstack([x_macro_s, x_news_s])
+    gbdt_dim = int(getattr(gbdt_model, "n_features_in_", x_full.shape[1]))
+    gbdt_in = x_full[:, :gbdt_dim]
+    if hasattr(gbdt_model, "feature_names_in_"):
+        gbdt_in = pd.DataFrame(gbdt_in, columns=gbdt_model.feature_names_in_)
+    gbdt_probs = gbdt_model.predict_proba(gbdt_in)  # (1, 3)
 
-    gbdt_names = getattr(gbdt_model, "feature_names_in_", getattr(gbdt_model, "feature_name_", None))
-    gbdt_dim = getattr(gbdt_model, "n_features_in_", combined_scaled_df.shape[1])
+    # C. If trained per-index regional heads exist (from updated Cell [35]), use the exact index head
+    if isinstance(regional_heads, dict) and ticker in regional_heads:
+        reg_in = np.hstack([nn_probs, gbdt_probs, x_news_s, x_macro_s])
+        return regional_heads[ticker].predict_proba(reg_in)[0].tolist()
 
-    if gbdt_names is not None and all(c in combined_scaled_df.columns for c in gbdt_names):
-        gbdt_in = combined_scaled_df[list(gbdt_names)]
-    elif gbdt_dim == x_m_scaled.shape[1]:
-        gbdt_in = x_m_scaled
-    elif gbdt_dim == x_n_scaled.shape[1]:
-        gbdt_in = x_n_scaled
+    # D. Meta-Stacker Classifier Forward Pass ([gbdt_probs, nn_probs])
+    stacked = np.hstack([gbdt_probs, nn_probs])
+    meta_dim = int(getattr(meta_clf, "n_features_in_", stacked.shape[1]))
+    if meta_dim == stacked.shape[1]:
+        meta_in = stacked
+    elif meta_dim < stacked.shape[1]:
+        meta_in = stacked[:, :meta_dim]
     else:
-        gbdt_in = combined_scaled_df.iloc[:, :gbdt_dim].values
+        ext = np.hstack([stacked, x_full])
+        meta_in = ext[:, :meta_dim]
 
-    gbdt_probs = gbdt_model.predict_proba(gbdt_in)[0]
+    if hasattr(meta_clf, "feature_names_in_"):
+        meta_in = pd.DataFrame(meta_in, columns=meta_clf.feature_names_in_)
 
-    # 3) Meta-Stacker Classifier Forward Pass
-    # Inspect meta_clf feature names to detect exact stacking order ([nn, gbdt] vs [gbdt, nn])
-    meta_names = [str(x).lower() for x in getattr(meta_clf, "feature_names_in_", [])]
-    meta_dim = getattr(meta_clf, "n_features_in_", 6)
-
-    if meta_names and ("nn" in meta_names[0] or "torch" in meta_names[0] or "dl" in meta_names[0]):
-        base_stack = np.concatenate([nn_probs, gbdt_probs]).reshape(1, -1)
-    else:
-        base_stack = np.concatenate([gbdt_probs, nn_probs]).reshape(1, -1)
-
-    if meta_dim != base_stack.shape[1]:
-        extended = np.hstack([base_stack, x_m_scaled, x_n_scaled])
-        meta_in = extended[:, :meta_dim]
-    else:
-        meta_in = base_stack
-
-    meta_probs = meta_clf.predict_proba(meta_in)[0]
-
-    if blend_mode == "PyTorch MultimodalNet Only":
-        final_probs = nn_probs
-    elif blend_mode == "GBDT Only":
-        final_probs = gbdt_probs
-    else:
-        final_probs = meta_probs
-
-    return {
-        "final_probs": final_probs.tolist(),
-        "nn_probs": nn_probs.tolist(),
-        "gbdt_probs": gbdt_probs.tolist(),
-        "meta_probs": meta_probs.tolist(),
-        "news_z_norm": float(np.linalg.norm(x_n_scaled)),
-        "macro_z_norm": float(np.linalg.norm(x_m_scaled)),
-        "x_news_scaled": x_n_scaled[0],
-    }
+    return meta_clf.predict_proba(meta_in)[0].tolist()
 
 
-# 6. Sidebar UI
+# 6. Sidebar User Input & Real-Time Execution
 st.sidebar.header("News Scenario Prompt")
 user_prompt = st.sidebar.text_area(
     "Enter custom headlines or market events (one per line):",
     value=(
-        "Federal Reserve announces unexpected interest rate cut amid rising inflation pressures.\n"
-        "China reports stronger than expected manufacturing GDP growth."
+        "Federal Reserve announces unexpected interest rate cut amid easing inflation.\n"
+        "China reports stronger than expected manufacturing GDP growth and stimulus."
     ),
     height=180,
-)
-
-inference_mode = st.sidebar.radio(
-    "Model Output Layer:",
-    ["Full Stacked Ensemble", "PyTorch MultimodalNet Only", "GBDT Only"],
-    help="Compare the Meta-Stacker against individual base models trained in Colab.",
 )
 
 predict_btn = st.sidebar.button("Predict Across All Indices")
 
 if predict_btn:
-    raw_headlines = [h.strip() for h in user_prompt.split("\n") if h.strip()]
-    if not raw_headlines:
+    headlines = [h.strip() for h in user_prompt.split("\n") if h.strip()]
+    if not headlines:
         st.warning("Please enter at least one headline in the sidebar.")
         st.stop()
 
-    with st.spinner("Vectorizing headlines via TF-IDF + VADER, pulling live macro data, and running Colab models..."):
-        df_news, news_stats = build_news_dataframe(raw_headlines)
+    with st.spinner("Running FinBERT + VADER + TF-IDF Anchors, fetching live yfinance/FRED macro series, and executing Two-Tower MultimodalMarketNet..."):
+        mkt_data, fred_data = fetch_live_macro_and_market()
+        x_news_s, diag = build_exact_22d_news_features(headlines)
 
-        index_map = [
+        indices = [
             ("Dow Jones (^DJI)", "^DJI"),
             ("S&P 500 (^GSPC)", "^GSPC"),
             ("Nikkei 225 (^N225)", "^N225"),
@@ -491,20 +555,19 @@ if predict_btn:
         ]
 
         results = []
-        for display_name, ticker in index_map:
-            df_macro = build_macro_dataframe(ticker)
-            out = run_ensemble_inference(df_macro, df_news, blend_mode=inference_mode)
-            results.append((display_name, ticker, out))
+        for label, sym in indices:
+            x_macro_s = build_exact_45d_macro_features(mkt_data, fred_data, focus_sym=sym)
+            probs = predict_for_index(sym, x_macro_s, x_news_s)
+            results.append((label, probs))
 
-    st.subheader(f"📊 Regional Index Predictions ({inference_mode})")
+    st.subheader("📊 Independent Regional Index Predictions")
     cols = st.columns(4)
     regime_names = ["Down (0)", "Neutral (1)", "Up (2)"]
 
-    for i, (idx_name, ticker, out) in enumerate(results):
-        probs = out["final_probs"]
-        pred_class_idx = int(np.argmax(probs))
-        pred_regime = regime_names[pred_class_idx]
-        conf = f"{probs[pred_class_idx] * 100:.1f}% Confidence"
+    for i, (idx_name, probs) in enumerate(results):
+        pred_idx = int(np.argmax(probs))
+        pred_regime = regime_names[pred_idx]
+        conf = f"{probs[pred_idx] * 100:.1f}% Confidence"
 
         with cols[i]:
             st.markdown(f"### {idx_name}")
@@ -513,57 +576,14 @@ if predict_btn:
                 {"Class": ["Down", "Neutral", "Up"], "Probability": probs}
             ).set_index("Class")
             st.bar_chart(prob_df, height=200)
-            st.caption(
-                f"PyTorch Up: `{out['nn_probs'][2]:.1%}` | GBDT Up: `{out['gbdt_probs'][2]:.1%}`"
-            )
 
     st.markdown("---")
-    # Live Verification Panel: Proves the trained artifacts are executing and shows exact feature schemas
-    with st.expander("🔍 Live Model & Artifact Diagnostics (Verify Trained Weights & Schemas)", expanded=True):
-        st.markdown(
-            f"**Input Headlines Processed:** `{len(raw_headlines)}` | "
-            f"**VADER Mean Compound:** `{news_stats['compound_mean']:.3f}` | "
-            f"**TF-IDF Vector Dim:** `{news_stats['tfidf_dim']}` (`{news_stats['tfidf_nonzero']}` active terms) | "
-            f"**Scaled News L2 Norm:** `{results[0][2]['news_z_norm']:.3f}`"
-        )
-
-        diag_rows = []
-        for idx_name, _, out in results:
-            diag_rows.append(
-                {
-                    "Index": idx_name,
-                    "PyTorch [Down, Neu, Up]": [round(x, 4) for x in out["nn_probs"]],
-                    "GBDT [Down, Neu, Up]": [round(x, 4) for x in out["gbdt_probs"]],
-                    "Meta-Stacker [Down, Neu, Up]": [round(x, 4) for x in out["meta_probs"]],
-                }
-            )
-        st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**`scaler_news.pkl` Expected Columns & Current Scaled Values:**")
-            news_debug = pd.DataFrame(
-                {
-                    "Feature": df_news.columns,
-                    "Raw Value": df_news.iloc[0].values,
-                    "Scaled Z-Score": results[0][2]["x_news_scaled"],
-                }
-            )
-            st.dataframe(news_debug, height=220, use_container_width=True)
-        with c2:
-            st.markdown("**Artifact Shapes Loaded from Repo:**")
-            st.json(
-                {
-                    "tfidf_anchor_type": type(tfidf_anchor).__name__,
-                    "scaler_macro_n_features": getattr(scaler_macro, "n_features_in_", "unknown"),
-                    "scaler_macro_has_names": hasattr(scaler_macro, "feature_names_in_"),
-                    "scaler_news_n_features": getattr(scaler_news, "n_features_in_", "unknown"),
-                    "scaler_news_has_names": hasattr(scaler_news, "feature_names_in_"),
-                    "gbdt_type": type(gbdt_model).__name__,
-                    "gbdt_n_features": getattr(gbdt_model, "n_features_in_", "unknown"),
-                    "meta_clf_type": type(meta_clf).__name__,
-                    "meta_clf_coef_or_features": getattr(meta_clf, "n_features_in_", "unknown"),
-                }
-            )
+    fb_tag = "ProsusAI/finbert Active" if diag["finbert_active"] else "VADER Fallback (install `transformers` for FinBERT)"
+    st.success(
+        f"Live Multimodal Inference Complete ({fb_tag}) | "
+        f"FinBERT Net Polarity: `{diag['fb_net']:+.3f}` | "
+        f"VADER Compound: `{diag['vader_comp']:+.3f}` | "
+        f"TF-IDF Anchor Spread (Up−Down): `{diag['tfidf_spread']:+.4f}`"
+    )
 else:
     st.info("👈 Type or paste your custom news headlines in the sidebar and click **Predict Across All Indices**.")
